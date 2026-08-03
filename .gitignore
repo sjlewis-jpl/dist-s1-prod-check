@@ -1,0 +1,37 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# vscode
+.vscode/
+.vs_code/
+
+# Mac files
+**/.DS_Store
+
+# Notebook Files
+**/.ipynb_checkpoints/
+**/ipynb_checkpoints/
+
+# Jupyter files
+*.db
+.jupyter/
+
+# Ruff
+.ruff_cache
+
+# env
+.env
+data/
+outputs/
+*.parquet
+*.csv
+
+# Data 
+data*/
+outputs*/
+
+*.log
+claude/
+
+__pycache__/

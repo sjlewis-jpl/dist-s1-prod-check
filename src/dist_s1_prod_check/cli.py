@@ -1,0 +1,487 @@
+from pathlib import Path
+
+import click
+import geopandas as gpd
+import pandas as pd
+
+from dist_s1_prod_check import checks, coverage, inputs, report, tags
+from dist_s1_prod_check.constants import DIST_S1_PARQUET, RTC_S1_PARQUET, TAGS_PARQUET, TARGET_TILES_FILE
+
+
+def _stamp() -> str:
+    return pd.Timestamp.now().strftime('%Y%m%dT%H%M%S')
+
+
+def _load_dist(data_dir: Path) -> gpd.GeoDataFrame:
+    path = data_dir / DIST_S1_PARQUET
+    if not path.exists():
+        raise click.ClickException(f'{path} not found; run `dist-s1-prod-check download-metadata` first.')
+    return gpd.read_parquet(path)
+
+
+def _load_rtc(data_dir: Path) -> gpd.GeoDataFrame:
+    path = data_dir / RTC_S1_PARQUET
+    if not path.exists():
+        raise click.ClickException(f'{path} not found; run `dist-s1-prod-check download-metadata` first.')
+    return gpd.read_parquet(path)
+
+
+def _load_tags(data_dir: Path) -> pd.DataFrame:
+    path = data_dir / TAGS_PARQUET
+    if not path.exists():
+        raise click.ClickException(f'{path} not found; run `dist-s1-prod-check fetch-tags` first.')
+    return pd.read_parquet(path)
+
+
+def _tile_geoms(df_dist: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    return df_dist[['mgrs_tile_id', 'geometry']].drop_duplicates(subset='mgrs_tile_id')
+
+
+def _resolve_bboxes(bbox: tuple | None, data_dir: Path) -> tuple[tuple | None, tuple | None]:
+    """Resolve an AOI bbox to (dist_bbox, rtc_bbox) and persist the target tile list for later checks."""
+    from dist_s1_prod_check.cmr import resolve_target_tiles
+
+    tiles_path = data_dir / TARGET_TILES_FILE
+    if bbox is None:
+        tiles_path.unlink(missing_ok=True)
+        return None, None
+    tile_ids, rtc_bbox = resolve_target_tiles(bbox)
+    tiles_path.write_text('\n'.join(tile_ids))
+    click.echo(f'AOI overlaps {len(tile_ids)} MGRS tiles; RTC-S1 bbox widened to {rtc_bbox}')
+    return bbox, rtc_bbox
+
+
+def _load_target_tiles(data_dir: Path) -> list[str] | None:
+    tiles_path = data_dir / TARGET_TILES_FILE
+    if not tiles_path.exists():
+        return None
+    return tiles_path.read_text().split()
+
+
+def _build_rtc_frame(df_rtc: gpd.GeoDataFrame, data_dir: Path) -> gpd.GeoDataFrame:
+    from dist_s1_prod_check.cmr import build_rtc_input_frame
+
+    return build_rtc_input_frame(df_rtc, mgrs_tile_ids=_load_target_tiles(data_dir))
+
+
+def _write_outputs(
+    out_dir: Path,
+    stamp: str,
+    tile_geoms: gpd.GeoDataFrame,
+    sections: list[dict],
+    csvs: dict[str, pd.DataFrame],
+    title: str,
+    subtitle: str,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, df in csvs.items():
+        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(
+            out_dir / f'{name}_{stamp}.csv', index=False
+        )
+    html_path = report.write_html_report(sections, tile_geoms, out_dir / f'report_{stamp}.html', title, subtitle)
+    click.echo(f'Wrote {html_path}')
+
+
+data_dir_option = click.option('--data-dir', type=click.Path(path_type=Path), default=Path('data'), show_default=True)
+out_dir_option = click.option('--out-dir', type=click.Path(path_type=Path), default=Path('outputs'), show_default=True)
+
+
+@click.group()
+def cli() -> None:
+    """Validate the DIST-S1 production system."""
+
+
+@cli.command()
+@click.option('--start', required=True, help='Start of acquisition period, e.g. 2026-01-01.')
+@click.option('--stop', required=True, help='End of acquisition period, e.g. 2026-03-01.')
+@click.option('--bbox', type=float, nargs=4, default=None, help='AOI as lon_min lat_min lon_max lat_max.')
+@click.option(
+    '--lookback/--no-lookback', default=True, show_default=True, help='Also fetch RTC-S1 metadata for baseline windows.'
+)
+@click.option('--skip-rtc', is_flag=True, help='Only fetch DIST-S1 metadata.')
+@click.option('--chunk-days', type=int, default=2, show_default=True)
+@click.option('--workers', type=int, default=8, show_default=True)
+@data_dir_option
+def download_metadata(
+    start: str, stop: str, bbox: tuple, lookback: bool, skip_rtc: bool, chunk_days: int, workers: int, data_dir: Path
+) -> None:
+    """Download DIST-S1 and RTC-S1 granule metadata from CMR into geoparquet tables (check 1)."""
+    from dist_s1_prod_check import cmr
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bbox = tuple(bbox) if bbox else None
+    dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
+
+    df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, chunk_days=max(chunk_days, 7), max_workers=workers)
+    df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+    click.echo(f'DIST-S1: {len(df_dist)} granules -> {data_dir / DIST_S1_PARQUET}')
+
+    if skip_rtc:
+        return
+    if lookback:
+        df_rtc = cmr.get_rtc_s1_table_with_lookback(
+            start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers
+        )
+    else:
+        df_rtc = cmr.get_rtc_s1_table(start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers)
+    df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+    click.echo(f'RTC-S1: {len(df_rtc)} granules -> {data_dir / RTC_S1_PARQUET}')
+
+
+@cli.command()
+@click.option('--workers', type=int, default=16, show_default=True)
+@click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
+@click.option('--seed', type=int, default=42, show_default=True)
+@data_dir_option
+def fetch_tags(workers: int, sample: int, seed: int, data_dir: Path) -> None:
+    """Fetch product GeoTIFF tags (inputs, prior product) from the DAAC; resumable."""
+    df_dist = checks.deduplicate_products(_load_dist(data_dir))
+    if sample:
+        df_dist = df_dist.sample(n=min(sample, len(df_dist)), random_state=seed)
+    df_tags = tags.fetch_tags_table(df_dist, data_dir / TAGS_PARQUET, max_workers=workers)
+    n_err = int((df_tags.error != '').sum())
+    click.echo(f'Tags: {len(df_tags)} fetched, {n_err} errors -> {data_dir / TAGS_PARQUET}')
+
+
+def _wkt_by_tile(tile_geoms: gpd.GeoDataFrame) -> dict[str, str]:
+    from shapely import to_wkt
+
+    return {row.mgrs_tile_id: to_wkt(row.geometry, rounding_precision=4) for row in tile_geoms.itertuples()}
+
+
+def _append_tile_wkt(df: pd.DataFrame, wkt_map: dict[str, str]) -> pd.DataFrame:
+    df = df.copy()
+    df['mgrs_tile_wkt'] = df.mgrs_tile_id.map(wkt_map)
+    return df
+
+
+def _vertex_search_url(wkt: str | None, post_acq_dt: pd.Timestamp) -> str:
+    from urllib.parse import quote
+
+    from shapely import from_wkt, to_wkt
+
+    if not wkt:
+        return ''
+    geom = from_wkt(wkt)
+    if geom.geom_type == 'MultiPolygon':
+        geom = max(geom.geoms, key=lambda g: g.area)
+    start = (post_acq_dt - pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    end = (post_acq_dt + pd.Timedelta(days=1)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    vertex_wkt = to_wkt(geom, rounding_precision=4).replace(', ', ',').replace('POLYGON (', 'POLYGON(')
+    return (
+        f'https://search.asf.alaska.edu/#/?dataset=OPERA-S1&productTypes=RTC'
+        f'&polygon={quote(vertex_wkt)}&start={start}&end={end}&resultsLoaded=true'
+    )
+
+
+def _issue_summary(df_bad: pd.DataFrame) -> dict | None:
+    if df_bad.empty:
+        return None
+    counts = df_bad.issue_type.value_counts().reset_index()
+    counts.columns = ['issue_type', 'n_rows']
+    return {
+        'title': 'Issue types (click a row to filter the table above)',
+        'columns': ['issue_type', 'n_rows'],
+        'records': counts.to_dict('records'),
+    }
+
+
+def _duplicates_section(
+    df_dist: gpd.GeoDataFrame, wkt_map: dict[str, str]
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    df_dup = _append_tile_wkt(checks.check_duplicates(df_dist), wkt_map)
+    section = report.build_section(
+        'duplicates', 'Duplicates', 'DIST-S1 granules sharing the same tile and acquisition time.', df_dup, len(df_dist)
+    )
+    return [section], {'duplicates': df_dup}
+
+
+def _ordering_section(df_dedup: pd.DataFrame, wkt_map: dict[str, str]) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    df_order = checks.check_processing_order(df_dedup)
+    df_bad = _append_tile_wkt(df_order[df_order.out_of_order], wkt_map)
+    section = report.build_section(
+        'ordering',
+        'Processing order',
+        'Products processed out of acquisition order within their MGRS tile.',
+        df_bad,
+        len(df_order),
+    )
+    return [section], {'ordering_failures': df_bad, 'ordering': df_order}
+
+
+def _confirmation_section(
+    df_dedup: pd.DataFrame, df_tags: pd.DataFrame, expect_none_at_start: bool, wkt_map: dict[str, str]
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    df_conf = checks.check_confirmation(df_dedup, df_tags, expect_none_at_start=expect_none_at_start)
+    df_conf = df_conf[df_conf.opera_id.isin(df_tags.opera_id)]
+    df_bad = _append_tile_wkt(df_conf[~df_conf.confirmed_ok], wkt_map)
+    section = report.build_section(
+        'confirmation',
+        'Confirmation chain',
+        'Products whose prior_dist_s1_product tag does not point to the previous product in the tile time series.',
+        df_bad,
+        len(df_conf),
+    )
+    tiles = checks.summarize_by_tile(df_conf.assign(fail=~df_conf.confirmed_ok), 'fail')
+    return [section], {'confirmation_failures': df_bad, 'confirmation_tiles': tiles}
+
+
+def _inputs_section(
+    df_tags: pd.DataFrame, df_frame: gpd.GeoDataFrame | None, mode: str, workers: int, wkt_map: dict[str, str]
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    if mode == 'offline':
+        df_results = inputs.check_inputs_offline(df_tags, df_frame)
+    else:
+        df_results = inputs.check_inputs_online(df_tags, max_workers=workers)
+    df_bad = _append_tile_wkt(df_results[df_results.inputs_correct != True], wkt_map)  # noqa: E712
+    n_checked = df_results.opera_id.nunique()
+
+    post_mask = df_bad.issue_type.str.contains('Post', case=False)
+    pre_mask = df_bad.issue_type.str.contains('Pre', case=False) & ~post_mask
+    sections = [
+        report.build_section(
+            'inputs',
+            'Product inputs',
+            'Products whose recorded pre/post RTC-S1 inputs differ from the re-enumerated expected inputs.',
+            df_bad,
+            n_checked,
+            summary=_issue_summary(df_bad),
+        ),
+        report.build_section(
+            'inputs_post',
+            'Inputs: post issues',
+            'Subset of product-input issues involving post RTC-S1 inputs (wrong or missing post images).',
+            df_bad[post_mask],
+            n_checked,
+            summary=_issue_summary(df_bad[post_mask]),
+        ),
+        report.build_section(
+            'inputs_pre',
+            'Inputs: pre issues',
+            'Subset of product-input issues involving pre (baseline) RTC-S1 inputs.',
+            df_bad[pre_mask],
+            n_checked,
+            summary=_issue_summary(df_bad[pre_mask]),
+        ),
+    ]
+    csvs = {
+        'inputs_failures': df_bad,
+        'inputs_failures_post': df_bad[post_mask],
+        'inputs_failures_pre': df_bad[pre_mask],
+        'inputs': df_results,
+    }
+    return sections, csvs
+
+
+def _coverage_section(
+    df_dedup: pd.DataFrame, df_frame: gpd.GeoDataFrame, start: str, stop: str, wkt_map: dict[str, str]
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    df_groups = coverage.expected_pass_groups(df_frame, start, stop)
+    df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame)
+    df_missing = df_cov[~df_cov.product_found & df_cov.missing_product_expected]
+    df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids'], errors='ignore'), wkt_map)
+    df_missing['asf_search_url'] = [
+        _vertex_search_url(row.mgrs_tile_wkt, row.post_acq_dt) for row in df_missing.itertuples()
+    ]
+    df_orphans = coverage.check_orphan_products(df_groups, df_dedup)
+
+    summary = None
+    df_by_tile = pd.DataFrame(columns=['mgrs_tile_id', 'n_missing', 'missing_post_dates'])
+    if not df_missing.empty:
+        df_by_tile = (
+            df_missing.groupby('mgrs_tile_id')
+            .agg(
+                n_missing=('post_acq_dt', 'size'),
+                missing_post_dates=('post_acq_dt', lambda s: ';'.join(pd.to_datetime(s).dt.strftime('%Y-%m-%d'))),
+            )
+            .reset_index()
+            .sort_values('n_missing', ascending=False)
+        )
+        summary = {
+            'title': 'Missing products by tile (click a row to filter the table above)',
+            'columns': ['mgrs_tile_id', 'n_missing', 'missing_post_dates'],
+            'records': df_by_tile.to_dict('records'),
+        }
+    section = report.build_section(
+        'coverage',
+        'Coverage',
+        'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none.',
+        df_missing,
+        len(df_cov),
+        summary=summary,
+    )
+    csvs = {
+        'coverage_missing': df_missing,
+        'coverage_missing_by_tile': df_by_tile,
+        'coverage': df_cov,
+        'coverage_orphans': df_orphans,
+    }
+    return [section], csvs
+
+
+@cli.command()
+@data_dir_option
+@out_dir_option
+def check_duplicates(data_dir: Path, out_dir: Path) -> None:
+    """Check for duplicated DIST-S1 products (check 2)."""
+    df_dist = _load_dist(data_dir)
+    sections, csvs = _duplicates_section(df_dist, _wkt_by_tile(_tile_geoms(df_dist)))
+    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 duplicates', '')
+
+
+@cli.command()
+@data_dir_option
+@out_dir_option
+def check_ordering(data_dir: Path, out_dir: Path) -> None:
+    """Check processing order matches acquisition order (check 3)."""
+    df_dist = _load_dist(data_dir)
+    df_dedup = checks.deduplicate_products(df_dist)
+    sections, csvs = _ordering_section(df_dedup, _wkt_by_tile(_tile_geoms(df_dist)))
+    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 processing order', '')
+
+
+@cli.command()
+@click.option(
+    '--expect-none-at-start', is_flag=True, help='Require the first product per tile to have no prior (mission start).'
+)
+@data_dir_option
+@out_dir_option
+def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path) -> None:
+    """Check the confirmation chain via prior product tags (check 4)."""
+    df_dist = _load_dist(data_dir)
+    df_dedup = checks.deduplicate_products(df_dist)
+    sections, csvs = _confirmation_section(
+        df_dedup, _load_tags(data_dir), expect_none_at_start, _wkt_by_tile(_tile_geoms(df_dist))
+    )
+    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 confirmation chain', '')
+
+
+@cli.command()
+@click.option('--mode', type=click.Choice(['offline', 'online']), default='offline', show_default=True)
+@click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
+@click.option('--seed', type=int, default=42, show_default=True)
+@click.option('--workers', type=int, default=8, show_default=True)
+@data_dir_option
+@out_dir_option
+def check_inputs(mode: str, sample: int, seed: int, workers: int, data_dir: Path, out_dir: Path) -> None:
+    """Check product inputs against re-enumerated expected inputs (check 5)."""
+    df_dist = _load_dist(data_dir)
+    df_tags = _load_tags(data_dir)
+    df_tags = df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)]
+    if sample:
+        df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
+    df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir) if mode == 'offline' else None
+    sections, csvs = _inputs_section(df_tags, df_frame, mode, workers, _wkt_by_tile(_tile_geoms(df_dist)))
+    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 product inputs', '')
+
+
+@cli.command()
+@click.option('--start', required=True)
+@click.option('--stop', required=True)
+@data_dir_option
+@out_dir_option
+def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None:
+    """Check all triggerable DIST-S1 products exist given available RTC-S1 inputs (check 6)."""
+    df_dist = _load_dist(data_dir)
+    df_dedup = checks.deduplicate_products(df_dist)
+    df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir)
+    sections, csvs = _coverage_section(df_dedup, df_frame, start, stop, _wkt_by_tile(_tile_geoms(df_dist)))
+    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 coverage', '')
+
+
+@cli.command()
+@click.option('--start', required=True, help='Start of acquisition period, e.g. 2026-01-01.')
+@click.option('--stop', required=True, help='End of acquisition period, e.g. 2026-03-01.')
+@click.option('--bbox', type=float, nargs=4, default=None)
+@click.option('--workers', type=int, default=16, show_default=True)
+@click.option('--cmr-workers', type=int, default=8, show_default=True)
+@click.option(
+    '--sample-inputs', type=int, default=0, show_default=True, help='Sample N products for the inputs check (0 = all).'
+)
+@click.option(
+    '--sample-tiles',
+    type=int,
+    default=0,
+    show_default=True,
+    help='Restrict every check to N random MGRS tiles (full time series per tile) for fast iteration (0 = all).',
+)
+@click.option('--seed', type=int, default=42, show_default=True)
+@click.option('--expect-none-at-start', is_flag=True)
+@click.option('--refresh', is_flag=True, help='Re-download metadata tables even if present.')
+@data_dir_option
+@out_dir_option
+def run_all(
+    start: str,
+    stop: str,
+    bbox: tuple,
+    workers: int,
+    cmr_workers: int,
+    sample_inputs: int,
+    sample_tiles: int,
+    seed: int,
+    expect_none_at_start: bool,
+    refresh: bool,
+    data_dir: Path,
+    out_dir: Path,
+) -> None:
+    """Run checks 1-6 end to end: download metadata, fetch tags, run every check, write CSVs and an HTML report."""
+    from dist_s1_prod_check import cmr
+
+    stamp = _stamp()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    bbox = tuple(bbox) if bbox else None
+
+    refresh_meta = refresh or not (data_dir / DIST_S1_PARQUET).exists() or not (data_dir / RTC_S1_PARQUET).exists()
+    if refresh_meta:
+        dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
+        df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers)
+        df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+        df_rtc = cmr.get_rtc_s1_table_with_lookback(start, stop, bbox=rtc_bbox, max_workers=cmr_workers)
+        df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+    df_dist = _load_dist(data_dir)
+    if sample_tiles:
+        all_tiles = pd.Series(sorted(df_dist.mgrs_tile_id.unique()))
+        keep = set(all_tiles.sample(n=min(sample_tiles, len(all_tiles)), random_state=seed))
+        df_dist = df_dist[df_dist.mgrs_tile_id.isin(keep)].reset_index(drop=True)
+        click.echo(f'Sampled {len(keep)} of {len(all_tiles)} tiles')
+    click.echo(f'DIST-S1 products: {len(df_dist)}')
+    df_rtc = _load_rtc(data_dir)
+    click.echo(f'RTC-S1 granules: {len(df_rtc)}')
+    from dist_s1_prod_check.cmr import build_rtc_input_frame
+
+    frame_tiles = sorted(keep) if sample_tiles else _load_target_tiles(data_dir)
+    df_frame = build_rtc_input_frame(df_rtc, mgrs_tile_ids=frame_tiles)
+
+    df_dedup = checks.deduplicate_products(df_dist)
+    df_tags_products = (
+        df_dedup if not sample_inputs else df_dedup.sample(n=min(sample_inputs, len(df_dedup)), random_state=42)
+    )
+    df_tags = tags.fetch_tags_table(df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers)
+    df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
+
+    wkt_map = _wkt_by_tile(_tile_geoms(df_dist))
+    sections, csvs = [], {}
+    for build in (
+        lambda: _duplicates_section(df_dist, wkt_map),
+        lambda: _ordering_section(df_dedup, wkt_map),
+        lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map),
+        lambda: _inputs_section(df_tags, df_frame, 'offline', workers, wkt_map),
+        lambda: _coverage_section(df_dedup, df_frame, start, stop, wkt_map),
+    ):
+        built_sections, section_csvs = build()
+        for section in built_sections:
+            click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
+        sections.extend(built_sections)
+        csvs.update(section_csvs)
+
+    _write_outputs(
+        out_dir,
+        stamp,
+        _tile_geoms(df_dist),
+        sections,
+        csvs,
+        'DIST-S1 Production Check',
+        f'{start} to {stop}'
+        + (f' over {bbox}' if bbox else ' (global)')
+        + (f' - sample of {sample_tiles} tiles' if sample_tiles else ''),
+    )

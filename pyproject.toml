@@ -1,0 +1,107 @@
+[project]
+authors = [{name = "Charlie Marshak", email = "charlie.z.marshak@jpl.nasa.gov"}]
+dependencies = ["dist-s1-enumerator>=1.0.13,<2"]
+name = "dist-s1-prod-check"
+requires-python = ">= 3.11"
+version = "0.1.0"
+
+[project.scripts]
+dist-s1-prod-check = "dist_s1_prod_check.cli:cli"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[tool.pixi.pypi-dependencies]
+dist_s1_prod_check = { path = ".", editable = true }
+
+[tool.pixi.dependencies]
+jupyterlab = ">=4.6.2,<5"
+jupyter-collaboration = ">=4.4.1,<5"
+numpy = ">=2.5.1,<3"
+scipy = ">=1.18.0,<2"
+scikit-image = ">=0.26.0,<0.27"
+pandas = ">=3.0.5,<4"
+geopandas = ">=1.1.4,<2"
+rasterio = ">=1.5.0,<2"
+xarray = ">=2026.7.0,<2027"
+ruff = ">=0.16.1,<0.17"
+tenacity = ">=9.1.4,<10"
+tqdm = ">=4.70.0,<5"
+click = ">=8.4.2,<9"
+requests = ">=2.34.2,<3"
+pyarrow = ">=25.0.0,<26"
+boto3 = ">=1.43.46,<2"
+shapely = ">=2.1.2,<3"
+earthaccess = ">=0.18.0,<0.19"
+asf_search = ">=6.3.1,<7"
+pandera = ">=0.32.1,<0.33"
+[tool.pixi.tasks]
+lint = "ruff check ."
+format = "ruff format ."
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+exclude = [
+    ".eggs",
+    ".git",
+    ".pixi",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "build",
+    "dist",
+    "site-packages",
+    "notebooks/*",
+]
+indent-width = 4
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+
+[tool.ruff.lint]
+select = [
+    "F",   # flake8: https://docs.astral.sh/ruff/rules/#flake8-f
+    "E",   # flake8: https://docs.astral.sh/ruff/rules/#flake8-e
+    "I",   # isort: https://docs.astral.sh/ruff/rules/#isort-i
+    "UP",  # pyupgrade: https://docs.astral.sh/ruff/rules/#pyupgrade-up
+    "D",   # pydocstyle: https://docs.astral.sh/ruff/rules/#pydocstyle-d
+    "ANN", # annotations: https://docs.astral.sh/ruff/rules/#flake8-annotations-ann
+    "PTH", # use-pathlib-pth: https://docs.astral.sh/ruff/rules/#flake8-use-pathlib-pth
+    "TRY", # tryceratops
+    "Q",   # flake8-quotes: https://docs.astral.sh/ruff/rules/#flake8-quotes-q
+]
+ignore = [
+    "D100",   # Missing docstring in public module
+    "D101",   # Missing docstring in public class
+    "D102",   # Missing docstring in public method
+    "D103",   # Missing docstring in public function
+    "D104",   # Missing docstring in public package
+    "D105",   # Missing docstring in magic method
+    "D203",   # 1 blank line required before class docstring
+    "D213",   # Multi-line docstring summary should start at the second line
+    "TRY003", # Avoid specifying long messages outside the exception
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/dist_s1_prod_check/report.py" = ["E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[tool.ruff.lint.isort]
+case-sensitive = true
+lines-after-imports = 2

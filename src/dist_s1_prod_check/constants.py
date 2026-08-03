@@ -1,0 +1,25 @@
+DIST_S1_CONCEPT_ID = 'C4090131664-ASF'
+RTC_S1_CONCEPT_ID = 'C2777436413-ASF'
+CMR_GRANULES_URL = 'https://cmr.earthdata.nasa.gov/search/granules.umm_json'
+CMR_PAGE_SIZE = 2000
+
+LAYER_URL_MAP = {
+    'alert_url': 'GEN-DIST-STATUS',
+    'metric_url': 'GEN-METRIC',
+    'alert_acq_url': 'GEN-DIST-STATUS-ACQ',
+}
+
+CUMULUS_RTC_BASE = 'https://cumulus.asf.earthdatacloud.nasa.gov/OPERA/OPERA_L2_RTC-S1/'
+
+DELTA_LOOKBACK_DAYS = (365, 730, 1095)
+MAX_PRE_IMGS_PER_BURST = (4, 3, 3)
+DELTA_WINDOW_DAYS = 60
+POST_DATE_BUFFER_SECONDS = 300
+
+DEFAULT_TAG_WORKERS = 16
+DEFAULT_CMR_WORKERS = 8
+
+DIST_S1_PARQUET = 'dist_s1_products.parquet'
+RTC_S1_PARQUET = 'rtc_s1_products.parquet'
+TAGS_PARQUET = 'dist_s1_tags.parquet'
+TARGET_TILES_FILE = 'target_mgrs_tiles.txt'
