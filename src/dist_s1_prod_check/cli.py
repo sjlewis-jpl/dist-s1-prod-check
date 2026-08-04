@@ -5,7 +5,13 @@ import geopandas as gpd
 import pandas as pd
 
 from dist_s1_prod_check import checks, coverage, inputs, report, tags
-from dist_s1_prod_check.constants import DIST_S1_PARQUET, RTC_S1_PARQUET, TAGS_PARQUET, TARGET_TILES_FILE
+from dist_s1_prod_check.constants import (
+    DIST_S1_PARQUET,
+    INPUTS_CHECKPOINT_PARQUET,
+    RTC_S1_PARQUET,
+    TAGS_PARQUET,
+    TARGET_TILES_FILE,
+)
 
 
 def _stamp() -> str:
@@ -33,8 +39,10 @@ def _load_tags(data_dir: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-def _tile_geoms(df_dist: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    return df_dist[['mgrs_tile_id', 'geometry']].drop_duplicates(subset='mgrs_tile_id')
+def _all_tile_geoms() -> gpd.GeoDataFrame:
+    from dist_s1_enumerator.mgrs_burst_data import get_mgrs_table
+
+    return get_mgrs_table()[['mgrs_tile_id', 'geometry']]
 
 
 def _resolve_bboxes(bbox: tuple | None, data_dir: Path) -> tuple[tuple | None, tuple | None]:
@@ -64,6 +72,22 @@ def _build_rtc_frame(df_rtc: gpd.GeoDataFrame, data_dir: Path) -> gpd.GeoDataFra
     return build_rtc_input_frame(df_rtc, mgrs_tile_ids=_load_target_tiles(data_dir))
 
 
+def _write_csvs(out_dir: Path, stamp: str, csvs: dict[str, pd.DataFrame]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, df in csvs.items():
+        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(
+            out_dir / f'{name}_{stamp}.csv', index=False
+        )
+
+
+def _write_report(
+    out_dir: Path, stamp: str, tile_geoms: gpd.GeoDataFrame, sections: list[dict], title: str, subtitle: str
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    html_path = report.write_html_report(sections, tile_geoms, out_dir / f'report_{stamp}.html', title, subtitle)
+    click.echo(f'Wrote {html_path}')
+
+
 def _write_outputs(
     out_dir: Path,
     stamp: str,
@@ -73,13 +97,8 @@ def _write_outputs(
     title: str,
     subtitle: str,
 ) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for name, df in csvs.items():
-        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(
-            out_dir / f'{name}_{stamp}.csv', index=False
-        )
-    html_path = report.write_html_report(sections, tile_geoms, out_dir / f'report_{stamp}.html', title, subtitle)
-    click.echo(f'Wrote {html_path}')
+    _write_csvs(out_dir, stamp, csvs)
+    _write_report(out_dir, stamp, tile_geoms, sections, title, subtitle)
 
 
 data_dir_option = click.option('--data-dir', type=click.Path(path_type=Path), default=Path('data'), show_default=True)
@@ -160,7 +179,7 @@ def _vertex_search_url(wkt: str | None, post_acq_dt: pd.Timestamp) -> str:
 
     from shapely import from_wkt, to_wkt
 
-    if not wkt:
+    if not isinstance(wkt, str) or not wkt:
         return ''
     geom = from_wkt(wkt)
     if geom.geom_type == 'MultiPolygon':
@@ -227,10 +246,15 @@ def _confirmation_section(
 
 
 def _inputs_section(
-    df_tags: pd.DataFrame, df_frame: gpd.GeoDataFrame | None, mode: str, workers: int, wkt_map: dict[str, str]
+    df_tags: pd.DataFrame,
+    df_frame: gpd.GeoDataFrame | None,
+    mode: str,
+    workers: int,
+    wkt_map: dict[str, str],
+    checkpoint_path: Path | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     if mode == 'offline':
-        df_results = inputs.check_inputs_offline(df_tags, df_frame)
+        df_results = inputs.check_inputs_offline(df_tags, df_frame, checkpoint_path=checkpoint_path, workers=workers)
     else:
         df_results = inputs.check_inputs_online(df_tags, max_workers=workers)
     df_bad = _append_tile_wkt(df_results[df_results.inputs_correct != True], wkt_map)  # noqa: E712
@@ -325,8 +349,8 @@ def _coverage_section(
 def check_duplicates(data_dir: Path, out_dir: Path) -> None:
     """Check for duplicated DIST-S1 products (check 2)."""
     df_dist = _load_dist(data_dir)
-    sections, csvs = _duplicates_section(df_dist, _wkt_by_tile(_tile_geoms(df_dist)))
-    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 duplicates', '')
+    sections, csvs = _duplicates_section(df_dist, _wkt_by_tile(_all_tile_geoms()))
+    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 duplicates', '')
 
 
 @cli.command()
@@ -336,8 +360,8 @@ def check_ordering(data_dir: Path, out_dir: Path) -> None:
     """Check processing order matches acquisition order (check 3)."""
     df_dist = _load_dist(data_dir)
     df_dedup = checks.deduplicate_products(df_dist)
-    sections, csvs = _ordering_section(df_dedup, _wkt_by_tile(_tile_geoms(df_dist)))
-    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 processing order', '')
+    sections, csvs = _ordering_section(df_dedup, _wkt_by_tile(_all_tile_geoms()))
+    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 processing order', '')
 
 
 @cli.command()
@@ -351,9 +375,9 @@ def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path
     df_dist = _load_dist(data_dir)
     df_dedup = checks.deduplicate_products(df_dist)
     sections, csvs = _confirmation_section(
-        df_dedup, _load_tags(data_dir), expect_none_at_start, _wkt_by_tile(_tile_geoms(df_dist))
+        df_dedup, _load_tags(data_dir), expect_none_at_start, _wkt_by_tile(_all_tile_geoms())
     )
-    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 confirmation chain', '')
+    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 confirmation chain', '')
 
 
 @cli.command()
@@ -371,8 +395,15 @@ def check_inputs(mode: str, sample: int, seed: int, workers: int, data_dir: Path
     if sample:
         df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
     df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir) if mode == 'offline' else None
-    sections, csvs = _inputs_section(df_tags, df_frame, mode, workers, _wkt_by_tile(_tile_geoms(df_dist)))
-    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 product inputs', '')
+    sections, csvs = _inputs_section(
+        df_tags,
+        df_frame,
+        mode,
+        workers,
+        _wkt_by_tile(_all_tile_geoms()),
+        checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
+    )
+    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 product inputs', '')
 
 
 @cli.command()
@@ -385,8 +416,8 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None
     df_dist = _load_dist(data_dir)
     df_dedup = checks.deduplicate_products(df_dist)
     df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir)
-    sections, csvs = _coverage_section(df_dedup, df_frame, start, stop, _wkt_by_tile(_tile_geoms(df_dist)))
-    _write_outputs(out_dir, _stamp(), _tile_geoms(df_dist), sections, csvs, 'DIST-S1 coverage', '')
+    sections, csvs = _coverage_section(df_dedup, df_frame, start, stop, _wkt_by_tile(_all_tile_geoms()))
+    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 coverage', '')
 
 
 @cli.command()
@@ -395,6 +426,13 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None
 @click.option('--bbox', type=float, nargs=4, default=None)
 @click.option('--workers', type=int, default=16, show_default=True)
 @click.option('--cmr-workers', type=int, default=8, show_default=True)
+@click.option(
+    '--inputs-workers',
+    type=int,
+    default=8,
+    show_default=True,
+    help='Processes for the offline inputs check (the long stage).',
+)
 @click.option(
     '--sample-inputs', type=int, default=0, show_default=True, help='Sample N products for the inputs check (0 = all).'
 )
@@ -416,6 +454,7 @@ def run_all(
     bbox: tuple,
     workers: int,
     cmr_workers: int,
+    inputs_workers: int,
     sample_inputs: int,
     sample_tiles: int,
     seed: int,
@@ -433,6 +472,7 @@ def run_all(
 
     refresh_meta = refresh or not (data_dir / DIST_S1_PARQUET).exists() or not (data_dir / RTC_S1_PARQUET).exists()
     if refresh_meta:
+        (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
         dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
         df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers)
         df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
@@ -459,29 +499,33 @@ def run_all(
     df_tags = tags.fetch_tags_table(df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers)
     df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
 
-    wkt_map = _wkt_by_tile(_tile_geoms(df_dist))
-    sections, csvs = [], {}
-    for build in (
-        lambda: _duplicates_section(df_dist, wkt_map),
-        lambda: _ordering_section(df_dedup, wkt_map),
-        lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map),
-        lambda: _inputs_section(df_tags, df_frame, 'offline', workers, wkt_map),
-        lambda: _coverage_section(df_dedup, df_frame, start, stop, wkt_map),
-    ):
-        built_sections, section_csvs = build()
-        for section in built_sections:
-            click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
-        sections.extend(built_sections)
-        csvs.update(section_csvs)
-
-    _write_outputs(
-        out_dir,
-        stamp,
-        _tile_geoms(df_dist),
-        sections,
-        csvs,
-        'DIST-S1 Production Check',
+    wkt_map = _wkt_by_tile(_all_tile_geoms())
+    subtitle = (
         f'{start} to {stop}'
         + (f' over {bbox}' if bbox else ' (global)')
-        + (f' - sample of {sample_tiles} tiles' if sample_tiles else ''),
+        + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
     )
+    sections = []
+    try:
+        for build in (
+            lambda: _duplicates_section(df_dist, wkt_map),
+            lambda: _ordering_section(df_dedup, wkt_map),
+            lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map),
+            lambda: _inputs_section(
+                df_tags,
+                df_frame,
+                'offline',
+                inputs_workers,
+                wkt_map,
+                checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
+            ),
+            lambda: _coverage_section(df_dedup, df_frame, start, stop, wkt_map),
+        ):
+            built_sections, section_csvs = build()
+            for section in built_sections:
+                click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
+            sections.extend(built_sections)
+            _write_csvs(out_dir, stamp, section_csvs)
+    finally:
+        if sections:
+            _write_report(out_dir, stamp, _all_tile_geoms(), sections, 'DIST-S1 Production Check', subtitle)

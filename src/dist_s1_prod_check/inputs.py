@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -163,14 +163,53 @@ def _check_products_against_expected(df_tags_tile: pd.DataFrame, df_expected: pd
     return records
 
 
-def check_inputs_offline(df_tags: pd.DataFrame, df_rtc_frame: gpd.GeoDataFrame) -> pd.DataFrame:
+def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.GeoDataFrame) -> list[dict]:
+    try:
+        with Path('/dev/null').open('w') as devnull, redirect_stdout(devnull):
+            df_expected = enumerate_dist_s1_products(
+                df_tile_frame.reset_index(drop=True), mgrs_tile_ids=[tile], tqdm_enabled=False
+            )
+        df_expected = pd.DataFrame(df_expected.drop(columns='geometry'))
+        df_expected['opera_id_trunc'] = df_expected.opera_id.map(get_opera_id_trunc)
+        return _check_products_against_expected(df_tags_tile, df_expected)
+    except Exception as e:
+        return [
+            {
+                'opera_id': row.opera_id,
+                'mgrs_tile_id': tile,
+                'inputs_correct': None,
+                'issue_type': 'Enumeration error',
+                'issue_value': f'{type(e).__name__}: {e}',
+            }
+            for row in df_tags_tile.itertuples()
+        ]
+
+
+def check_inputs_offline(
+    df_tags: pd.DataFrame,
+    df_rtc_frame: gpd.GeoDataFrame,
+    checkpoint_path: str | Path | None = None,
+    workers: int = 1,
+    checkpoint_every: int = 100,
+) -> pd.DataFrame:
     """Compare each product's recorded RTC inputs against an offline re-enumeration from the RTC-S1 table.
 
-    Enumerates expected products one MGRS tile at a time and discards them after comparison, so
-    peak memory at global scale is bounded by a single tile's inputs, not the whole corpus.
+    Enumerates expected products one MGRS tile at a time (in `workers` processes when > 1) and
+    discards them after comparison, so peak memory is bounded by a single tile's inputs. With
+    `checkpoint_path`, results are persisted every `checkpoint_every` tiles and prior results are
+    reused, so interrupted runs resume instead of restarting.
     """
-    records = []
-    df_err = df_tags[df_tags.error != '']
+    records: list[dict] = []
+    done_opera: set[str] = set()
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
+    if checkpoint_path and checkpoint_path.exists():
+        df_ck = pd.read_parquet(checkpoint_path)
+        records = df_ck.to_dict('records')
+        done_opera = set(df_ck.opera_id)
+
+    requested_opera = set(df_tags.opera_id)
+    df_todo = df_tags[~df_tags.opera_id.isin(done_opera)]
+    df_err = df_todo[df_todo.error != '']
     records.extend(
         {
             'opera_id': row.opera_id,
@@ -181,32 +220,56 @@ def check_inputs_offline(df_tags: pd.DataFrame, df_rtc_frame: gpd.GeoDataFrame) 
         }
         for row in df_err.itertuples()
     )
-    df_ok = df_tags[df_tags.error == '']
+    df_ok = df_todo[df_todo.error == '']
     tags_by_tile = dict(tuple(df_ok.groupby('mgrs_tile_id')))
     frame_tiles = set(df_rtc_frame.mgrs_tile_id.unique())
 
-    with Path('/dev/null').open('w') as devnull, redirect_stdout(devnull):
-        frame_groups = df_rtc_frame.groupby('mgrs_tile_id')
-        for tile, df_tags_tile in tqdm(sorted(tags_by_tile.items()), desc='Checking inputs by tile'):
-            if tile not in frame_tiles:
-                records.extend(
-                    {
-                        'opera_id': row.opera_id,
-                        'mgrs_tile_id': tile,
-                        'inputs_correct': False,
-                        'issue_type': 'No expected product found',
-                        'issue_value': f'tile={tile} absent from RTC-S1 table',
-                    }
-                    for row in df_tags_tile.itertuples()
-                )
-                continue
-            df_expected = enumerate_dist_s1_products(
-                frame_groups.get_group(tile).reset_index(drop=True), mgrs_tile_ids=[tile], tqdm_enabled=False
+    def _flush() -> None:
+        if checkpoint_path is None:
+            return
+        tmp_path = checkpoint_path.with_suffix('.parquet.tmp')
+        pd.DataFrame(records).to_parquet(tmp_path, compression='zstd')
+        tmp_path.replace(checkpoint_path)
+
+    frame_groups = df_rtc_frame.groupby('mgrs_tile_id')
+    tiles_todo = []
+    for tile, df_tags_tile in sorted(tags_by_tile.items()):
+        if tile not in frame_tiles:
+            records.extend(
+                {
+                    'opera_id': row.opera_id,
+                    'mgrs_tile_id': tile,
+                    'inputs_correct': False,
+                    'issue_type': 'No expected product found',
+                    'issue_value': f'tile={tile} absent from RTC-S1 table',
+                }
+                for row in df_tags_tile.itertuples()
             )
-            df_expected = pd.DataFrame(df_expected.drop(columns='geometry'))
-            df_expected['opera_id_trunc'] = df_expected.opera_id.map(get_opera_id_trunc)
-            records.extend(_check_products_against_expected(df_tags_tile, df_expected))
-    return pd.DataFrame(records)
+            continue
+        tiles_todo.append(tile)
+
+    with tqdm(total=len(tiles_todo), desc='Checking inputs by tile') as pbar:
+        if workers <= 1:
+            for k, tile in enumerate(tiles_todo):
+                records.extend(_check_one_tile(tile, tags_by_tile[tile], frame_groups.get_group(tile)))
+                pbar.update(1)
+                if (k + 1) % checkpoint_every == 0:
+                    _flush()
+        else:
+            window = workers * 4
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                for i in range(0, len(tiles_todo), window):
+                    futures = [
+                        pool.submit(_check_one_tile, tile, tags_by_tile[tile], frame_groups.get_group(tile))
+                        for tile in tiles_todo[i : i + window]
+                    ]
+                    for future in as_completed(futures):
+                        records.extend(future.result())
+                        pbar.update(1)
+                    _flush()
+    _flush()
+    df = pd.DataFrame(records)
+    return df[df.opera_id.isin(requested_opera)].reset_index(drop=True)
 
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60), reraise=True)

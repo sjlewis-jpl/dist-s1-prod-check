@@ -39,9 +39,14 @@ nohup dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 \
     --data-dir data --out-dir outputs > run_all.log 2>&1 &
 ```
 
-Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh`, and
-tag fetching (the slow part: one DAAC read per product, ~230k products globally) caches to
-`data/dist_s1_tags.parquet` so a rerun of the same command picks up where it left off.
+Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh`, tag
+fetching (one DAAC read per product, ~230k globally) caches to `data/dist_s1_tags.parquet`, and
+the offline inputs check checkpoints per tile to `data/inputs_check_results.parquet` — a rerun
+of the same command picks up where it left off. The inputs check runs in `--inputs-workers`
+processes (default 8; raise on a many-core server). `--refresh` clears the inputs checkpoint
+along with the metadata tables since results depend on the RTC table. CSVs are written as each
+check completes and the HTML report is written even if a later check fails, so a crash never
+discards finished work.
 
 Over an AOI instead:
 

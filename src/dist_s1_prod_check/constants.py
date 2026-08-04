@@ -22,4 +22,5 @@ DEFAULT_CMR_WORKERS = 8
 DIST_S1_PARQUET = 'dist_s1_products.parquet'
 RTC_S1_PARQUET = 'rtc_s1_products.parquet'
 TAGS_PARQUET = 'dist_s1_tags.parquet'
+INPUTS_CHECKPOINT_PARQUET = 'inputs_check_results.parquet'
 TARGET_TILES_FILE = 'target_mgrs_tiles.txt'
