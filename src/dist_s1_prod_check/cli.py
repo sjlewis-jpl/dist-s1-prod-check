@@ -210,7 +210,12 @@ def _duplicates_section(
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_dup = _append_tile_wkt(checks.check_duplicates(df_dist), wkt_map)
     section = report.build_section(
-        'duplicates', 'Duplicates', 'DIST-S1 granules sharing the same tile and acquisition time.', df_dup, len(df_dist)
+        'duplicates',
+        'Duplicates',
+        'DIST-S1 granules sharing the same tile and acquisition time. The last-processed granule of '
+        'each group is taken as the correct one; every other check runs on that granule only.',
+        df_dup,
+        len(df_dist),
     )
     return [section], {'duplicates': df_dup}
 
@@ -218,12 +223,15 @@ def _duplicates_section(
 def _ordering_section(df_dedup: pd.DataFrame, wkt_map: dict[str, str]) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_order = checks.check_processing_order(df_dedup)
     df_bad = _append_tile_wkt(df_order[df_order.out_of_order], wkt_map)
+    n_reprocessed = int(df_order.is_reprocessed.sum())
     section = report.build_section(
         'ordering',
         'Processing order',
-        'Products processed out of acquisition order within their MGRS tile.',
+        'Products processed before the previous acquisition in their MGRS tile. Excluded from this '
+        f'check: {n_reprocessed} reprocessed acquisitions (see Duplicates - their retained version is '
+        'processed late by construction) and the first evaluated product of each tile.',
         df_bad,
-        len(df_order),
+        int(df_order.evaluated.sum()),
     )
     return [section], {'ordering_failures': df_bad, 'ordering': df_order}
 
@@ -303,7 +311,7 @@ def _coverage_section(
     df_groups = coverage.expected_pass_groups(df_frame, start, stop)
     df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame)
     df_missing = df_cov[~df_cov.product_found & df_cov.missing_product_expected]
-    df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids'], errors='ignore'), wkt_map)
+    df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids', 'burst_pols'], errors='ignore'), wkt_map)
     df_missing['asf_search_url'] = [
         _vertex_search_url(row.mgrs_tile_wkt, row.post_acq_dt) for row in df_missing.itertuples()
     ]

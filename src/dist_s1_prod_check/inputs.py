@@ -11,6 +11,7 @@ from tqdm import tqdm
 from dist_s1_prod_check.constants import (
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
+    DUAL_POLARIZATIONS,
     MAX_PRE_IMGS_PER_BURST,
     POST_DATE_BUFFER_SECONDS,
 )
@@ -71,8 +72,46 @@ def _tracks_adjacent(track_numbers: list[int]) -> bool:
     return diff == 1 or diff == N_S1_TRACKS - 1
 
 
-def compare_inputs(df_actual: pd.DataFrame, df_expected_product: pd.DataFrame) -> list[dict]:
+def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str]) -> list[dict]:
+    """Flag inputs that are single polarization or whose baseline polarization differs from the post-image.
+
+    A burst's baseline must be built from acquisitions of the same dual polarization as its post-image
+    (VV+VH with VV+VH, HH+HV with HH+HV). Inputs absent from `pol_by_opera_id` (outside the RTC table)
+    are skipped; the RTC ID comparisons already report those.
+    """
+    pols = df_actual.opera_id_trunc.map(pol_by_opera_id)
+    df = df_actual.assign(polarizations=pols)[pols.notna()]
+    if df.empty:
+        return []
+
     issues = []
+    df_single = df[~df.polarizations.isin(DUAL_POLARIZATIONS)]
+    if not df_single.empty:
+        detail = ';'.join(f'{r.opera_id_trunc}={r.polarizations}' for r in df_single.itertuples())
+        issues.append({'issue_type': 'Single polarization input used', 'issue_value': detail})
+
+    df_post = df[df.input_category == 'post']
+    post_pol_by_burst = dict(zip(df_post.jpl_burst_id, df_post.polarizations))
+    df_pre = df[df.input_category == 'pre']
+    mismatched = [
+        (r.opera_id_trunc, r.polarizations, post_pol_by_burst[r.jpl_burst_id])
+        for r in df_pre.itertuples()
+        if r.jpl_burst_id in post_pol_by_burst and r.polarizations != post_pol_by_burst[r.jpl_burst_id]
+    ]
+    if mismatched:
+        detail = ';'.join(f'{opera_id}={pol} vs post-image {post_pol}' for opera_id, pol, post_pol in mismatched)
+        issues.append({'issue_type': 'Pre RTC baseline polarization mismatch', 'issue_value': detail})
+    return issues
+
+
+def compare_inputs(
+    df_actual: pd.DataFrame,
+    df_expected_product: pd.DataFrame,
+    pol_by_opera_id: dict[str, str] | None = None,
+) -> list[dict]:
+    issues = []
+    if pol_by_opera_id:
+        issues.extend(_polarization_issues(df_actual, pol_by_opera_id))
 
     track_numbers = sorted(df_actual.track_number.unique().tolist())
     if not _tracks_adjacent(track_numbers):
@@ -135,7 +174,9 @@ def _match_expected_product_id(
     return int(matches.product_id.iloc[0])
 
 
-def _check_products_against_expected(df_tags_tile: pd.DataFrame, df_expected: pd.DataFrame) -> list[dict]:
+def _check_products_against_expected(
+    df_tags_tile: pd.DataFrame, df_expected: pd.DataFrame, pol_by_opera_id: dict[str, str] | None = None
+) -> list[dict]:
     index_by_tile = _expected_product_index(df_expected)
     expected_by_product = dict(tuple(df_expected.groupby('product_id')))
 
@@ -156,7 +197,7 @@ def _check_products_against_expected(df_tags_tile: pd.DataFrame, df_expected: pd
                 }
             )
             continue
-        issues = compare_inputs(df_actual, expected_by_product[product_id])
+        issues = compare_inputs(df_actual, expected_by_product[product_id], pol_by_opera_id=pol_by_opera_id)
         if not issues:
             records.append({**base, 'inputs_correct': True, 'issue_type': '', 'issue_value': ''})
         records.extend({**base, 'inputs_correct': False, **issue} for issue in issues)
@@ -171,7 +212,8 @@ def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.Ge
             )
         df_expected = pd.DataFrame(df_expected.drop(columns='geometry'))
         df_expected['opera_id_trunc'] = df_expected.opera_id.map(get_opera_id_trunc)
-        return _check_products_against_expected(df_tags_tile, df_expected)
+        pol_by_opera_id = dict(zip(df_tile_frame.opera_id.map(get_opera_id_trunc), df_tile_frame.polarizations))
+        return _check_products_against_expected(df_tags_tile, df_expected, pol_by_opera_id=pol_by_opera_id)
     except Exception as e:
         return [
             {
@@ -301,7 +343,8 @@ def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataF
             df_post = df_actual[df_actual.input_category == 'post']
             track_number = int(df_actual.track_number.iloc[0])
             df_expected = _enumerate_one(row.mgrs_tile_id, track_number, str(df_post.acq_dt.min().date()))
-            issues = compare_inputs(df_actual, df_expected)
+            pol_by_opera_id = dict(zip(df_expected.opera_id_trunc, df_expected.polarizations))
+            issues = compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id)
         except Exception as e:
             return [
                 {

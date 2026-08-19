@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from warnings import warn
 
 import earthaccess
 import geopandas as gpd
@@ -24,6 +25,7 @@ from dist_s1_prod_check.constants import (
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
     DIST_S1_CONCEPT_ID,
+    DUAL_POLARIZATIONS,
     LAYER_URL_MAP,
     RTC_S1_CONCEPT_ID,
 )
@@ -322,8 +324,15 @@ def get_rtc_s1_table_with_lookback(
 
 
 def build_rtc_input_frame(df_rtc: gpd.GeoDataFrame, mgrs_tile_ids: list[str] | None = None) -> gpd.GeoDataFrame:
-    """Shape an RTC-S1 metadata table into the enumerator's rtc_s1_schema (LUT join adds one row per MGRS tile)."""
-    df = df_rtc[df_rtc.polarizations.isin(['VV+VH', 'HH+HV']) & df_rtc.geometry.notna()].copy()
+    """Shape an RTC-S1 metadata table into the enumerator's rtc_s1_schema (LUT join adds one row per MGRS tile).
+
+    Single-polarization granules are dropped here: DIST-S1 never uses them, as a post-image or in a baseline.
+    """
+    dual_pol = df_rtc.polarizations.isin(DUAL_POLARIZATIONS)
+    n_dropped = int((~dual_pol).sum())
+    if n_dropped:
+        warn(f'Dropping {n_dropped} RTC-S1 granules that are not dual polarization ({", ".join(DUAL_POLARIZATIONS)}).')
+    df = df_rtc[dual_pol & df_rtc.geometry.notna()].copy()
     df['acq_dt'] = pd.to_datetime(df.acq_dt, utc=True)
     df['pass_id'] = df.acq_dt.map(extract_pass_id)
     df['url_copol'] = df.url_copol.fillna('')

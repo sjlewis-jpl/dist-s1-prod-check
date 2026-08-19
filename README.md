@@ -8,8 +8,13 @@ Validation checks for the OPERA DIST-S1 production system. Cross-references prod
 
 1. **download-metadata** - DIST-S1 + RTC-S1 granule metadata from CMR into geoparquet tables
    (direct CMR queries, temporally chunked and threaded; no per-product API calls).
-2. **check-duplicates** - DIST-S1 granules sharing the same tile/acquisition.
-3. **check-ordering** - processing order matches acquisition order within each MGRS tile.
+2. **check-duplicates** - DIST-S1 granules sharing the same tile/acquisition. The last-processed
+   granule of a group is taken as the correct one; every other check runs on that granule only.
+3. **check-ordering** - processing order matches acquisition order within each MGRS tile. Each
+   product is compared against the previous acquisition in its tile, and reprocessed acquisitions
+   are excluded (their retained version is processed late by construction, which would otherwise
+   flag both it and everything acquired after it in the tile — a duplicate masquerading as an
+   ordering failure).
 4. **check-confirmation** - each product's `prior_dist_s1_product` tag points to the previous
    product in its tile time series.
 5. **check-inputs** - recorded pre/post RTC-S1 inputs match a re-enumeration
@@ -107,3 +112,10 @@ prefiltered to the check window. Measured: 680 B/row for the RTC table, so the g
   all data is embedded in the file.
 - Coverage baseline logic mirrors the enumerator defaults: lookback windows at 365/730/1095
   days, 60-day width, max 4/3/3 pre-images per burst, min 1.
+- **Polarization**: only dual-polarization RTC-S1 (`VV+VH`, `HH+HV`) is ever used - single-pol
+  granules are dropped when the RTC input frame is built and are never post-images or baseline
+  imagery. A burst's baseline must also match its post-image: a `VV+VH` post-image can only be
+  paired with `VV+VH` pre-images, and likewise for `HH+HV`. Coverage counts a burst as having a
+  baseline only when the lookback windows hold same-polarization acquisitions, and the inputs
+  check reports `Pre RTC baseline polarization mismatch` / `Single polarization input used` for
+  products that violate this.
