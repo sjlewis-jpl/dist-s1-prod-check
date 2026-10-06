@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 from warnings import warn
 
 import earthaccess
@@ -21,10 +22,11 @@ from tqdm import tqdm
 
 from dist_s1_prod_check.constants import (
     CMR_GRANULES_URL,
+    CMR_GRANULES_URLS,
     CMR_PAGE_SIZE,
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
-    DIST_S1_CONCEPT_ID,
+    DIST_S1_CONCEPT_IDS,
     DUAL_POLARIZATIONS,
     LAYER_URL_MAP,
     RTC_S1_CONCEPT_ID,
@@ -35,8 +37,8 @@ from dist_s1_prod_check.ids import get_opera_id_trunc, get_track_number
 DateLike = str | datetime | pd.Timestamp
 
 
-def get_edl_token() -> str:
-    auth = earthaccess.login()
+def get_edl_token(venue: str = 'PROD') -> str:
+    auth = earthaccess.login(system=earthaccess.UAT if venue == 'UAT' else earthaccess.PROD)
     assert auth.authenticated, 'Earthdata login failed; check ~/.netrc or EARTHDATA_* env vars.'
     return auth.token['access_token']
 
@@ -48,8 +50,8 @@ def _fmt_dt(t: DateLike) -> str:
 
 
 @retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
-def _get_page(params: dict, headers: dict) -> tuple[list[dict], str | None]:
-    resp = requests.get(CMR_GRANULES_URL, params=params, headers=headers, timeout=120)
+def _get_page(params: dict, headers: dict, cmr_url: str = CMR_GRANULES_URL) -> tuple[list[dict], str | None]:
+    resp = requests.get(cmr_url, params=params, headers=headers, timeout=120)
     resp.raise_for_status()
     return resp.json().get('items', []), resp.headers.get('CMR-Search-After')
 
@@ -62,6 +64,7 @@ def search_granules(
     bbox: tuple[float, float, float, float] | None = None,
     granule_name_pattern: str | None = None,
     parse_fn: Callable[[dict], dict] | None = None,
+    cmr_url: str = CMR_GRANULES_URL,
 ) -> list[dict]:
     """Search CMR granules; with `parse_fn`, each page is parsed as it arrives so raw UMM JSON is never accumulated."""
     params: dict = {
@@ -80,7 +83,7 @@ def search_granules(
     search_after = None
     while True:
         page_headers = headers | ({'CMR-Search-After': search_after} if search_after else {})
-        page_items, search_after = _get_page(params, page_headers)
+        page_items, search_after = _get_page(params, page_headers, cmr_url)
         items.extend(map(parse_fn, page_items) if parse_fn else page_items)
         if not page_items or search_after is None:
             return items
@@ -104,12 +107,15 @@ def search_granules_chunked(
     max_workers: int = 8,
     desc: str = 'CMR chunks',
     parse_fn: Callable[[dict], dict] | None = None,
+    cmr_url: str = CMR_GRANULES_URL,
 ) -> list[dict]:
     """Search CMR granules over a time range by splitting into temporal chunks queried concurrently."""
     chunks = _date_chunks(start_time, stop_time, chunk_days)
 
     def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> list[dict]:
-        return search_granules(collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn)
+        return search_granules(
+            collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
+        )
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
@@ -131,17 +137,34 @@ def _search_chunked_to_df(
     chunk_days: int = 3,
     max_workers: int = 8,
     desc: str = 'CMR chunks',
+    cmr_url: str = CMR_GRANULES_URL,
+    cache_dir: Path | None = None,
 ) -> pd.DataFrame:
     """Chunked CMR search where each chunk is converted to a compact DataFrame as it completes.
 
     Peak memory is bounded by the final concatenated table plus one in-flight chunk per worker,
-    never the whole corpus as python dicts.
+    never the whole corpus as python dicts. With `cache_dir`, each chunk is checkpointed to parquet
+    and reused on rerun, so an interrupted download resumes instead of starting over.
     """
     chunks = _date_chunks(start_time, stop_time, chunk_days)
+    if cache_dir is not None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
 
     def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> pd.DataFrame:
-        records = search_granules(collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn)
-        return pd.DataFrame(records)
+        path = None
+        if cache_dir is not None:
+            path = cache_dir / f'{collection_concept_id}_{chunk[0]:%Y%m%dT%H%M%S}_{chunk[1]:%Y%m%dT%H%M%S}.parquet'
+            if path.exists():
+                return pd.read_parquet(path)
+        records = search_granules(
+            collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
+        )
+        df_chunk = pd.DataFrame(records)
+        if path is not None:
+            tmp = path.with_suffix('.tmp')
+            df_chunk.to_parquet(tmp, compression='zstd')
+            tmp.replace(path)
+        return df_chunk
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
@@ -233,11 +256,12 @@ def get_dist_s1_table(
     token: str | None = None,
     chunk_days: int = 7,
     max_workers: int = 8,
+    venue: str = 'PROD',
 ) -> gpd.GeoDataFrame:
-    """Download DIST-S1 granule metadata from CMR into a GeoDataFrame with MGRS tile footprints."""
-    token = token or get_edl_token()
+    """Download DIST-S1 granule metadata from the PROD or UAT CMR into a GeoDataFrame with MGRS tile footprints."""
+    token = token or get_edl_token(venue)
     df = _search_chunked_to_df(
-        DIST_S1_CONCEPT_ID,
+        DIST_S1_CONCEPT_IDS[venue],
         start_time,
         stop_time,
         parse_dist_s1_granule,
@@ -245,7 +269,8 @@ def get_dist_s1_table(
         bbox=bbox,
         chunk_days=chunk_days,
         max_workers=max_workers,
-        desc='DIST-S1 CMR',
+        desc=f'DIST-S1 CMR ({venue})',
+        cmr_url=CMR_GRANULES_URLS[venue],
     )
     if df.empty:
         raise RuntimeError('No DIST-S1 granules returned; check the time range and Earthdata credentials.')
@@ -263,6 +288,7 @@ def get_rtc_s1_table(
     bbox: tuple[float, float, float, float] | None = None,
     chunk_days: int = 2,
     max_workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> gpd.GeoDataFrame:
     """Download RTC-S1 granule metadata from CMR into a GeoDataFrame with burst footprints."""
     df = _search_chunked_to_df(
@@ -274,6 +300,7 @@ def get_rtc_s1_table(
         chunk_days=chunk_days,
         max_workers=max_workers,
         desc='RTC-S1 CMR',
+        cache_dir=cache_dir,
     )
     if df.empty:
         raise RuntimeError('No RTC-S1 granules returned; check the time range.')
@@ -309,9 +336,10 @@ def get_rtc_s1_table_with_lookback(
     delta_window_days: int = DELTA_WINDOW_DAYS,
     chunk_days: int = 2,
     max_workers: int = 8,
+    cache_dir: Path | None = None,
 ) -> gpd.GeoDataFrame:
     tables = [
-        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers)
+        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers, cache_dir=cache_dir)
         for t0, t1 in lookback_date_ranges(start_time, stop_time, delta_lookback_days, delta_window_days)
     ]
     df = pd.concat(tables).drop_duplicates(subset='opera_id')
