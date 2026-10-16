@@ -47,6 +47,7 @@ DateLike = str | datetime | pd.Timestamp
 
 
 def get_edl_token(venue: str = 'PROD') -> str:
+    """Log in to Earthdata (PROD, or UAT for `venue="UAT"`) and return a bearer token for CMR."""
     auth = earthaccess.login(system=earthaccess.UAT if venue == 'UAT' else earthaccess.PROD)
     assert auth.authenticated, 'Earthdata login failed; check ~/.netrc or EARTHDATA_* env vars.'
     return auth.token['access_token']
@@ -314,6 +315,7 @@ def resolve_target_tiles(
 
 
 def parse_dist_s1_granule(item: dict) -> dict:
+    """Parse one DIST-S1 UMM-JSON CMR item into a row: id, tile, acquisition and processing time, layer URLs."""
     umm = item['umm']
     opera_id = umm['GranuleUR']
     tokens = opera_id.split('_')
@@ -334,6 +336,7 @@ def parse_dist_s1_granule(item: dict) -> dict:
 
 
 def parse_rtc_s1_granule(item: dict) -> dict:
+    """Parse one RTC-S1 UMM-JSON CMR item into a row: id, burst, times, track, polarization, layer URLs."""
     umm = item['umm']
     opera_id = umm['GranuleUR']
     tokens = opera_id.split('_')
@@ -550,6 +553,7 @@ def get_rtc_s1_table_with_lookback(
     cache_dir: Path | None = None,
     chunk_log: list[dict] | None = None,
 ) -> gpd.GeoDataFrame:
+    """Download RTC-S1 metadata for the window and every baseline lookback window, merged and deduplicated."""
     tables = [
         get_rtc_s1_table(
             t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers, cache_dir=cache_dir, chunk_log=chunk_log

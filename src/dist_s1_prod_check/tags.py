@@ -23,6 +23,7 @@ TAG_KEYS = ['mgrs_tile_id', 'pre_rtc_opera_ids', 'post_rtc_opera_ids', 'prior_di
     reraise=True,
 )
 def get_tags(url: str) -> dict[str, str]:
+    """Read the GeoTIFF tags of a product's STATUS layer at `url` (retried; raises `OfflineError` offline)."""
     network_allowed(f'reading tags from {url}')
     gdal_env = {
         'GDAL_DISABLE_READDIR_ON_OPEN': 'EMPTY_DIR',

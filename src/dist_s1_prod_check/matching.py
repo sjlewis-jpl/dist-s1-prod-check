@@ -46,6 +46,7 @@ class PassAssignment:
 
 
 def pass_key(row: object) -> PassKey:
+    """Return the key of an expected pass: ``(mgrs_tile_id, acq_group_id_within_mgrs_tile, pass_id)``."""
     return (row.mgrs_tile_id, int(row.acq_group_id_within_mgrs_tile), int(row.pass_id))
 
 

@@ -38,6 +38,7 @@ def _iso(t: str | pd.Timestamp | None) -> str | None:
 
 
 def now_utc() -> str:
+    """Return the current UTC time as an ISO string (``YYYY-MM-DDTHH:MM:SSZ``)."""
     return _iso(pd.Timestamp.now(tz='UTC'))
 
 
@@ -87,6 +88,7 @@ def lookback_complete(
 
 
 def sha256_file(path: str | Path) -> str:
+    """Return the hex sha256 of a file, read in 1 MiB blocks."""
     h = hashlib.sha256()
     with Path(path).open('rb') as f:
         for block in iter(lambda: f.read(1 << 20), b''):
@@ -113,10 +115,12 @@ def tool_version() -> str:
 
 
 def enumerator_version() -> str:
+    """Return the installed dist-s1-enumerator version."""
     return importlib.metadata.version('dist-s1-enumerator')
 
 
 def target_tiles_sha(tiles: list[str] | None) -> str | None:
+    """Return the sha256 of a sorted MGRS tile list (None for no list), as recorded in manifests."""
     if tiles is None:
         return None
     return hashlib.sha256('\n'.join(sorted(tiles)).encode()).hexdigest()
@@ -124,6 +128,8 @@ def target_tiles_sha(tiles: list[str] | None) -> str | None:
 
 @dataclass
 class TableManifest:
+    """Provenance of one cached metadata table (written as ``<table>.manifest.json`` next to its parquet)."""
+
     table: str
     venue: str
     source: str
@@ -157,6 +163,7 @@ class TableManifest:
 
 
 def manifest_path(parquet_path: str | Path) -> Path:
+    """Return the manifest path of a cached parquet: ``<table>.manifest.json`` beside it."""
     parquet_path = Path(parquet_path)
     return parquet_path.with_name(parquet_path.name.removesuffix('.parquet') + '.manifest.json')
 

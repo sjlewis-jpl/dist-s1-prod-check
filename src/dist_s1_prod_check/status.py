@@ -12,6 +12,8 @@ RUN_STATUS_FILE = 'run_status.json'
 
 
 class Status(StrEnum):
+    """Status of one checked unit (product, pass, link or group)."""
+
     PASS = 'PASS'  # checked, correct
     FAIL = 'FAIL'  # checked, wrong
     INFO = 'INFO'  # checked, noteworthy but not a failure
@@ -20,6 +22,8 @@ class Status(StrEnum):
 
 
 class SectionState(StrEnum):
+    """State of one report section."""
+
     COMPLETE = 'COMPLETE'  # ran to completion over its whole universe
     SAMPLED = 'SAMPLED'  # ran over a sample; universe and sample sizes are recorded
     EMPTY = 'EMPTY'  # universe was empty: 0 items checked
@@ -28,6 +32,8 @@ class SectionState(StrEnum):
 
 
 class RunState(StrEnum):
+    """State of a whole run, as written to ``run_status.json``."""
+
     RUNNING = 'RUNNING'
     COMPLETE = 'COMPLETE'
     INCOMPLETE = 'INCOMPLETE'
@@ -55,6 +61,8 @@ def _now_utc() -> str:
 
 @dataclass
 class RunStatus:
+    """A run status read back from ``run_status.json`` (a persisted RUNNING reads as INCOMPLETE)."""
+
     state: RunState
     raw_state: str
     checks_planned: list[str] = field(default_factory=list)

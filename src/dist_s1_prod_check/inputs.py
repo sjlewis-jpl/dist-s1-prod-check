@@ -36,6 +36,7 @@ N_S1_TRACKS = 175
 
 
 def parse_actual_inputs(pre_rtc_opera_ids: str, post_rtc_opera_ids: str) -> pd.DataFrame:
+    """Split comma-joined pre/post RTC-S1 ids from a product's tags into rows with burst, track and acquisition time."""
     pre_ids = [p for p in pre_rtc_opera_ids.split(',') if p]
     post_ids = [p for p in post_rtc_opera_ids.split(',') if p]
     df = pd.DataFrame(

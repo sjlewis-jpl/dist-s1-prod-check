@@ -16,11 +16,13 @@ class OfflineError(click.ClickException):
 
 
 def set_offline(offline: bool) -> None:
+    """Turn offline mode on or off for this process."""
     global _offline  # noqa: PLW0603
     _offline = bool(offline)
 
 
 def is_offline() -> bool:
+    """Return whether offline mode is on."""
     return _offline
 
 

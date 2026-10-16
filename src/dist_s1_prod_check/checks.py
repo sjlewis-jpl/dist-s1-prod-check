@@ -191,6 +191,8 @@ def ordering_by_tile(df_order: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize_by_tile(df_products: pd.DataFrame, fail_col: str) -> pd.DataFrame:
+    """Summarise products per MGRS tile: count, failures (rows where `fail_col` is true), ok, failing ids."""
+
     def _one(group: pd.DataFrame) -> pd.Series:
         bad = group[group[fail_col]]
         return pd.Series(
