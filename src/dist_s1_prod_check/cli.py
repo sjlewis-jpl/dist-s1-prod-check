@@ -729,8 +729,30 @@ def _duplicates_section(
 
 
 def _ordering_section(
-    df_dedup: pd.DataFrame, wkt_map: dict[str, str], state: SectionState = SectionState.COMPLETE
+    df_dedup: pd.DataFrame,
+    wkt_map: dict[str, str],
+    state: SectionState = SectionState.COMPLETE,
+    df_versions: pd.DataFrame | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    """Two views (decision 2, F08): first-production order over every version, and retained-version order."""
+    df_versions = df_dedup if df_versions is None else df_versions
+    df_first = checks.check_first_production_order(df_versions, df_dedup.opera_dedup_id)
+    df_first_bad = _append_tile_wkt(df_first[df_first.out_of_order], wkt_map)
+    n_first = int(df_first.evaluated.sum())
+    first = report.build_section(
+        'ordering_first_production',
+        'Processing order: first production',
+        'Acquisitions whose first version was processed before the first version of the previous acquisition in '
+        'their MGRS tile. Every version counts, so a later reprocessing never hides an inversion; the first '
+        'acquisition of each tile has no predecessor and is not evaluated.',
+        df_first_bad,
+        n_first,
+        state=state,
+        n_universe=len(df_first),
+        n_skipped=len(df_first) - n_first,
+        counts=df_first.status.value_counts().to_dict(),
+        note=f'{int(df_first.tie.sum())} ties (equal processing times) counted as in order',
+    )
     df_order = checks.check_processing_order(df_dedup)
     df_bad = _append_tile_wkt(df_order[df_order.out_of_order], wkt_map)
     n_reprocessed = int(df_order.is_reprocessed.sum())
@@ -746,8 +768,18 @@ def _ordering_section(
         state=state,
         n_universe=len(df_order),
         n_skipped=len(df_order) - n_evaluated,
+        counts=df_order.status.value_counts().to_dict(),
+        note=f'{int(df_order.tie.sum())} ties (equal processing times) counted as in order; '
+        f'{int((~df_order.evaluated).sum())} acquisitions not evaluated (per tile in ordering_tiles)',
     )
-    return [section], {'ordering_failures': df_bad, 'ordering': df_order}
+    csvs = {
+        'ordering_failures': df_bad,
+        'ordering': df_order,
+        'ordering_tiles': checks.ordering_by_tile(df_order),
+        'ordering_first_production_failures': df_first_bad,
+        'ordering_first_production': df_first,
+    }
+    return [first, section], csvs
 
 
 def _confirmation_section(
@@ -994,8 +1026,9 @@ def check_ordering(
         'ordering',
         'DIST-S1 processing order',
         lambda run: _ordering_section(
-            checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions)),
+            checks.deduplicate_products(df_all := _load_dist_checked(data_dir, run, product_versions)),
             _wkt_by_tile(_all_tile_geoms()),
+            df_versions=df_all,
         ),
         regression_baseline,
     )
@@ -1314,7 +1347,7 @@ def run_all(
         wkt_map = _wkt_by_tile(_all_tile_geoms())
         builds = {
             'duplicates': lambda: _duplicates_section(df_dist, wkt_map, all_state),
-            'ordering': lambda: _ordering_section(df_dedup, wkt_map, all_state),
+            'ordering': lambda: _ordering_section(df_dedup, wkt_map, all_state, df_versions=df_versions),
             'confirmation': lambda: _confirmation_section(
                 df_dedup, df_tags, expect_none_at_start, wkt_map, tag_state, df_versions=df_versions
             ),

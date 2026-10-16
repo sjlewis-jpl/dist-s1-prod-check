@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 
 from dist_s1_prod_check.status import Status
@@ -97,12 +98,7 @@ def check_processing_order(df_dist_dedup: pd.DataFrame) -> pd.DataFrame:
     df['prev_acq_time'] = evaluated['acq_time'].shift(1)
     df['prev_processing_time'] = evaluated['processing_time'].shift(1)
     df['processing_lag_hours'] = (df.processing_time - df.prev_processing_time).dt.total_seconds() / 3600
-    df['evaluated'] = df.prev_opera_id.notna()
-    df['out_of_order'] = df.evaluated & (df.processing_lag_hours < 0)
-    df['reason'] = [
-        f'processed {-lag:.1f} h before the previous acquisition in the tile ({prev})' if bad else ''
-        for bad, lag, prev in zip(df.out_of_order, df.processing_lag_hours, df.prev_opera_id)
-    ]
+    _judge_order(df, 'the previous acquisition in the tile')
     cols = [
         'opera_id',
         'mgrs_tile_id',
@@ -115,10 +111,83 @@ def check_processing_order(df_dist_dedup: pd.DataFrame) -> pd.DataFrame:
         'is_reprocessed',
         'evaluated',
         'out_of_order',
+        'tie',
+        'status',
         'reason',
     ]
     extra = [c for c in ['alert_url'] if c in df.columns]
     return df[cols + extra].reset_index(drop=True)
+
+
+def _judge_order(df: pd.DataFrame, what: str) -> None:
+    """Add `evaluated`, `out_of_order`, `tie`, `status` and `reason` from `prev_opera_id` and the processing lag.
+
+    A product processed before its predecessor is out of order (FAIL). Equal processing times are in order but
+    counted as `tie` (F36). A product with no predecessor is SKIPPED.
+    """
+    df['evaluated'] = df.prev_opera_id.notna()
+    df['out_of_order'] = df.evaluated & (df.processing_lag_hours < 0)
+    df['tie'] = df.evaluated & (df.processing_lag_hours == 0)
+    df['status'] = np.select([~df.evaluated, df.out_of_order], [Status.SKIPPED, Status.FAIL], Status.PASS)
+    df['reason'] = [
+        f'processed {-lag:.1f} h before {what} ({prev})' if bad else ''
+        for bad, lag, prev in zip(df.out_of_order, df.processing_lag_hours, df.prev_opera_id)
+    ]
+
+
+def check_first_production_order(df_versions: pd.DataFrame, dedup_ids: pd.Series | None = None) -> pd.DataFrame:
+    """Check that each acquisition was *first* produced after the previous acquisition in its tile (F08).
+
+    Takes every version (`df_versions`, before any processing filter) and keeps each acquisition's earliest
+    version, so a reprocessing never hides an original inversion. With `dedup_ids`, only those acquisitions are
+    reported (their predecessors still come from all of `df_versions`). Every acquisition but the first of its tile
+    is evaluated. Columns as `check_processing_order`, without `is_reprocessed`.
+    """
+    df = df_versions.sort_values(['opera_dedup_id', 'processing_time', 'opera_id'], kind='stable')
+    df = df.drop_duplicates(subset='opera_dedup_id', keep='first').sort_values(['mgrs_tile_id', 'acq_time']).copy()
+    grouped = df.groupby('mgrs_tile_id')
+    df['prev_opera_id'] = grouped['opera_id'].shift(1)
+    df['prev_acq_time'] = grouped['acq_time'].shift(1)
+    df['prev_processing_time'] = grouped['processing_time'].shift(1)
+    df['processing_lag_hours'] = (df.processing_time - df.prev_processing_time).dt.total_seconds() / 3600
+    _judge_order(df, 'the first production of the previous acquisition in the tile')
+    if dedup_ids is not None:
+        df = df[df.opera_dedup_id.isin(set(dedup_ids))]
+    cols = [
+        'opera_id',
+        'mgrs_tile_id',
+        'acq_time',
+        'processing_time',
+        'prev_opera_id',
+        'prev_acq_time',
+        'prev_processing_time',
+        'processing_lag_hours',
+        'evaluated',
+        'out_of_order',
+        'tie',
+        'status',
+        'reason',
+    ]
+    extra = [c for c in ['alert_url'] if c in df.columns]
+    return df[cols + extra].reset_index(drop=True)
+
+
+def ordering_by_tile(df_order: pd.DataFrame) -> pd.DataFrame:
+    """Per tile: products, evaluated, not evaluated (reprocessed or first), reprocessed, failures, ties (F08)."""
+    reprocessed = df_order.is_reprocessed if 'is_reprocessed' in df_order.columns else False
+    return (
+        df_order.assign(not_evaluated=~df_order.evaluated, reprocessed=reprocessed)
+        .groupby('mgrs_tile_id')
+        .agg(
+            n_products=('opera_id', 'size'),
+            n_evaluated=('evaluated', 'sum'),
+            n_not_evaluated=('not_evaluated', 'sum'),
+            n_reprocessed=('reprocessed', 'sum'),
+            n_failures=('out_of_order', 'sum'),
+            n_ties=('tie', 'sum'),
+        )
+        .reset_index()
+    )
 
 
 def summarize_by_tile(df_products: pd.DataFrame, fail_col: str) -> pd.DataFrame:

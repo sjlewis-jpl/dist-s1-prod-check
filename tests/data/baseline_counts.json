@@ -29,7 +29,10 @@
       "inputs_failures_post": 6,
       "inputs_failures_pre": 42,
       "ordering": 618,
-      "ordering_failures": 0
+      "ordering_failures": 0,
+      "ordering_first_production": 618,
+      "ordering_first_production_failures": 5,
+      "ordering_tiles": 19
     },
     "sections": {
       "confirmation": {
@@ -59,6 +62,10 @@
       "ordering": {
         "n_checked": 588,
         "n_failures": 0
+      },
+      "ordering_first_production": {
+        "n_checked": 599,
+        "n_failures": 5
       }
     }
   },
@@ -96,7 +103,10 @@
       "inputs_failures_post": 6,
       "inputs_failures_pre": 41,
       "ordering": 582,
-      "ordering_failures": 0
+      "ordering_failures": 0,
+      "ordering_first_production": 582,
+      "ordering_first_production_failures": 21,
+      "ordering_tiles": 19
     },
     "sections": {
       "confirmation": {
@@ -126,6 +136,10 @@
       "ordering": {
         "n_checked": 251,
         "n_failures": 0
+      },
+      "ordering_first_production": {
+        "n_checked": 563,
+        "n_failures": 21
       }
     }
   }

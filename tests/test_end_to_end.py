@@ -167,8 +167,8 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
         'sections': {s['key']: {'n_checked': s['n_checked'], 'n_failures': s['n_failures']} for s in sections},
         'csv_rows': _csv_rows(out_dir),
     }
-    assert set(counts['sections']) == {'duplicates', 'ordering', 'confirmation', 'inputs', 'inputs_post',
-                                       'inputs_pre', 'coverage'}  # fmt: skip
+    assert set(counts['sections']) == {'duplicates', 'ordering_first_production', 'ordering', 'confirmation',
+                                       'inputs', 'inputs_post', 'inputs_pre', 'coverage'}  # fmt: skip
 
     reference_path = COUNTS_PATH if COUNTS_PATH.exists() else COUNTS_MIRROR
     reference = json.loads(reference_path.read_text()) if reference_path.exists() else {}

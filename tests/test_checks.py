@@ -118,7 +118,6 @@ def _flagged(csvs: dict[str, pd.DataFrame]) -> set[str]:
 
 
 # aa2014f: B is dropped as reprocessed, C is compared only with A and is in order; nothing is flagged
-@pytest.mark.xfail(strict=True, reason='F08: ordering drops reprocessed acquisitions, hiding inversions')
 def test_f08_first_production_view_flags_inversion(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -218,3 +217,22 @@ def test_f17_legacy_tag_rows_derive_prior_presence() -> None:
     from dist_s1_prod_check.tags import prior_tag_present
 
     assert prior_tag_present(tags).tolist() == [False, True]
+
+
+# --- Task 3.3 / 3.10 (F08, F36): first-production view, not-evaluated counts and ties ------------------------------
+
+
+def test_f36_equal_processing_times_are_ties_not_failures() -> None:
+    df = make_dist([{'tile': TILE, 'acq': ACQ_A, 'proc': T1}, {'tile': TILE, 'acq': ACQ_B, 'proc': T1}])
+    for df_order in (
+        checks.check_processing_order(checks.deduplicate_products(df)),
+        checks.check_first_production_order(df),
+    ):
+        row = df_order.iloc[1]
+        assert (row.status, bool(row.tie), bool(row.out_of_order)) == ('PASS', True, False)
+
+
+def test_f08_ordering_tiles_count_not_evaluated() -> None:
+    df_order = checks.check_processing_order(checks.deduplicate_products(make_dist(_ordering_inputs())))
+    tiles = checks.ordering_by_tile(df_order).iloc[0]
+    assert (tiles.n_products, tiles.n_evaluated, tiles.n_not_evaluated, tiles.n_reprocessed) == (3, 1, 2, 1)
