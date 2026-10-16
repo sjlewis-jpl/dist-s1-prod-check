@@ -403,7 +403,6 @@ class _FakeDataset:
 
 
 # aa2014f: confirmation_failures CSV is empty; the first product passes with prior_used='None' (key stored as '').
-@pytest.mark.xfail(strict=True, reason='F17: absent prior_dist_s1_product key passes under --expect-none-at-start')
 def test_f17_absent_prior_key_fails(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

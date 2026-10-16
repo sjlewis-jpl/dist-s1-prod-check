@@ -48,9 +48,11 @@ def _fetch_one(record: dict) -> dict:
     try:
         tags = get_tags(record['alert_url'])
         out.update({key: tags.get(key, '') for key in TAG_KEYS})
+        out['prior_tag_present'] = 'prior_dist_s1_product' in tags
     except Exception as e:
         out.update(dict.fromkeys(TAG_KEYS, ''))
         out['error'] = f'{type(e).__name__}: {e}'
+        out['prior_tag_present'] = False
     return {k: out[k] for k in CACHE_COLUMNS}
 
 
@@ -58,7 +60,19 @@ MISSING_TAG_URL = 'missing_tag_url'
 NO_CACHED_TAG_ROW = 'no cached tag row (run fetch-tags)'
 TAG_COLUMNS = ['opera_id', 'error', *TAG_KEYS]
 # The cached table also records the URL each row was read from (F23).
-CACHE_COLUMNS = [*TAG_COLUMNS, 'source_url']
+CACHE_COLUMNS = [*TAG_COLUMNS, 'source_url', 'prior_tag_present']
+
+
+def prior_tag_present(df_tags: pd.DataFrame) -> pd.Series:
+    """Whether each row's STATUS layer carried a `prior_dist_s1_product` key (F17).
+
+    Rows cached before the flag was recorded derive it losslessly: an absent key was stored as '', while a product
+    without a prior carries the literal 'None'.
+    """
+    derived = (df_tags.error.fillna('x') == '') & (df_tags.prior_dist_s1_product.fillna('') != '')
+    if 'prior_tag_present' not in df_tags.columns:
+        return derived
+    return df_tags.prior_tag_present.astype('boolean').fillna(derived).astype(bool)
 
 
 def cached_source_urls(df_tags: pd.DataFrame) -> pd.Series:
@@ -101,6 +115,7 @@ def align_to_products(
     no_url = urls.isna().to_numpy()
     df.loc[no_url, TAG_KEYS] = ''
     df.loc[no_url, 'error'] = MISSING_TAG_URL
+    df['prior_tag_present'] = prior_tag_present(df)
     blank_tile = (df.error != '') & (df.mgrs_tile_id == '')
     if 'mgrs_tile_id' in df_products.columns:
         df.loc[blank_tile, 'mgrs_tile_id'] = df_products.mgrs_tile_id[blank_tile]

@@ -1,6 +1,7 @@
 import pandas as pd
 
 from dist_s1_prod_check.status import Status
+from dist_s1_prod_check.tags import prior_tag_present
 
 
 # Deterministic order within a tile/acquisition group: last processed wins, ties broken by the full opera_id.
@@ -146,6 +147,22 @@ def _version_index(df_versions: pd.DataFrame) -> tuple[dict, dict, dict]:
     return prev_acq, versions, proc
 
 
+def _impossible_prior(prior: str, tile: str, acq_time: pd.Timestamp) -> str:
+    """Reason a prior can never be right for a product of `tile` acquired at `acq_time` ('' if it could be)."""
+    if prior == 'None':
+        return ''
+    tokens = prior.split('_')
+    try:
+        prior_tile, prior_acq = tokens[3].lstrip('T'), pd.Timestamp(tokens[4].rstrip('Z'))
+    except (IndexError, ValueError):
+        return f'impossible prior {prior}: not a DIST-S1 product id'
+    if prior_tile != tile:
+        return f'impossible prior {prior}: tile {prior_tile}, not {tile}'
+    if prior_acq >= acq_time:
+        return f'impossible prior {prior}: acquired at {prior_acq}, not before the product'
+    return ''
+
+
 def _confirm_one(b_id: str, b_proc: pd.Timestamp, prior: str, prev: str, versions: dict, proc: dict) -> tuple:
     """Status, reason and ideal prior for a product `b_id` whose previous acquisition is `prev` (decision 3)."""
     candidates = versions[prev]
@@ -190,7 +207,9 @@ def check_confirmation(
     """
     df_versions = df_dist_dedup if df_versions is None else df_versions
     prev_acq, versions, proc = _version_index(pd.concat([df_versions, df_dist_dedup]).drop_duplicates('opera_id'))
-    df = df_dist_dedup.merge(df_tags[['opera_id', 'prior_dist_s1_product', 'error']], on='opera_id', how='left')
+    tag_cols = ['opera_id', 'prior_dist_s1_product', 'error']
+    df_tags = df_tags.assign(prior_tag_present=prior_tag_present(df_tags))
+    df = df_dist_dedup.merge(df_tags[[*tag_cols, 'prior_tag_present']], on='opera_id', how='left')
     df = df.sort_values(['mgrs_tile_id', 'acq_time'])
 
     df['tag_missing'] = df.error.isna() | (df.error != '') | df.prior_dist_s1_product.isna()
@@ -204,9 +223,15 @@ def check_confirmation(
         if row.tag_missing:
             detail = row.error if isinstance(row.error, str) and row.error else 'no tag row'
             status, reason, ideal = Status.UNKNOWN, f'could not read prior_dist_s1_product tag ({detail})', 'None'
+        elif not row.prior_tag_present:
+            ideal = versions[prev][-1] if prev else 'None'
+            status, reason = Status.FAIL, 'prior tag absent: the STATUS layer has no prior_dist_s1_product key'
         elif prev is None:
             ideal = 'None'
-            if not expect_none_at_start:
+            impossible = _impossible_prior(row.prior_used, row.mgrs_tile_id, row.acq_time)
+            if impossible:
+                status, reason = Status.FAIL, impossible
+            elif not expect_none_at_start:
                 status, reason = Status.SKIPPED, 'first acquisition of the tile in the window'
             elif row.prior_used == 'None':
                 status, reason = Status.PASS, ''

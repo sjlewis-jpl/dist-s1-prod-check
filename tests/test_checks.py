@@ -187,3 +187,34 @@ def test_run_all_excludes_other_versions(tmp_path: Path, tmp_data_dir: Path, cli
     assert v01 not in html
     duplicates = pd.read_csv(next(out_dir.glob('duplicates_*.csv')))
     assert duplicates.empty, 'the v0.1 product must not form a duplicate group with the v1.0 one'
+
+
+# --- Task 3.2 (F17): prior tag presence and first-in-window priors -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ('prior', 'present', 'want_status', 'want_reason'),
+    [
+        ('None', True, 'SKIPPED', 'first acquisition'),
+        (dist_id(TILE, ACQ_A - pd.Timedelta(days=12), T1), True, 'SKIPPED', 'first acquisition'),
+        (dist_id('11SLT', ACQ_A - pd.Timedelta(days=12), T1), True, 'FAIL', 'impossible prior'),
+        (dist_id(TILE, ACQ_B, T1), True, 'FAIL', 'not before the product'),
+        ('', False, 'FAIL', 'prior tag absent'),
+    ],
+)
+def test_f17_first_in_window_prior(prior: str, present: bool, want_status: str, want_reason: str) -> None:
+    df = checks.deduplicate_products(make_dist([{'opera_id': A_V1}]))
+    tags = make_tags([{'opera_id': A_V1, 'prior_dist_s1_product': prior}])
+    if not present:
+        tags = tags.assign(prior_tag_present=False)
+    row = checks.check_confirmation(df, tags).iloc[0]
+    assert (row.status, want_reason in row.reason) == (want_status, True), row.reason
+
+
+def test_f17_legacy_tag_rows_derive_prior_presence() -> None:
+    tags = make_tags(
+        [{'opera_id': A_V1, 'prior_dist_s1_product': ''}, {'opera_id': B, 'prior_dist_s1_product': 'None'}]
+    )
+    from dist_s1_prod_check.tags import prior_tag_present
+
+    assert prior_tag_present(tags).tolist() == [False, True]
