@@ -189,7 +189,6 @@ def _check_inputs(runner: CliRunner, data_dir: Path, out_dir: Path) -> pd.DataFr
 
 
 # aa2014f: rerun returns the checkpointed inputs_correct=True for P; the new RTC table expects 3 more pre ids.
-@pytest.mark.xfail(strict=True, reason='F04: checkpointed PASS survives an RTC re-download that changes inputs')
 def test_f04_checkpoint_pass_reevaluated_after_rtc_change(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner
 ) -> None:
@@ -215,7 +214,6 @@ def test_f04_checkpoint_pass_reevaluated_after_rtc_change(
 
 
 # aa2014f: the checkpointed 'Tag read error' row is returned again (inputs_correct None) after the tag became readable.
-@pytest.mark.xfail(strict=True, reason='F04: checkpointed Tag read error rows are never retried')
 def test_f04_checkpoint_tag_error_retried(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
     dist, rtc, tag_df = _world()
     target = dist.opera_id.iloc[0]
@@ -231,6 +229,55 @@ def test_f04_checkpoint_tag_error_retried(tmp_path: Path, tmp_data_dir: Path, cl
     second = _check_inputs(cli_runner, tmp_data_dir, tmp_path / 'out2')
     rows = second[second.opera_id == target]
     assert rows.inputs_correct.tolist() == [True], f'tag error not retried: {rows.to_dict("records")}'
+
+
+def test_f04_checkpoint_recomputed_after_tool_version_change(
+    tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from dist_s1_prod_check import inputs, manifest
+
+    seed_data_dir(tmp_data_dir, *_world(), target_tiles=[TILE])
+    tiles_checked: list[str] = []
+    check_one_tile = inputs._check_one_tile
+
+    def _spy(tile: str, *args: object) -> list[dict]:
+        tiles_checked.append(tile)
+        return check_one_tile(tile, *args)
+
+    monkeypatch.setattr(inputs, '_check_one_tile', _spy)
+    _check_inputs(cli_runner, tmp_data_dir, tmp_path / 'out1')
+    _check_inputs(cli_runner, tmp_data_dir, tmp_path / 'out2')
+    assert tiles_checked == [TILE], 'an unchanged context must reuse the checkpoint'
+
+    monkeypatch.setattr(manifest, 'tool_version', lambda: 'another-version')
+    _check_inputs(cli_runner, tmp_data_dir, tmp_path / 'out3')
+    assert tiles_checked == [TILE, TILE], 'a new tool version must recompute checkpointed results'
+    df_ck = pd.read_parquet(tmp_data_dir / INPUTS_CHECKPOINT_PARQUET)
+    assert df_ck.fingerprint.notna().all() and df_ck.inputs_correct.notna().all()
+
+
+def test_f04_unchecked_rows_never_checkpointed(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    dist, rtc, tag_df = _world()
+    target = dist.opera_id.iloc[0]
+    tag_df.loc[tag_df.opera_id == target, 'error'] = 'RasterioIOError: 404'
+    seed_data_dir(tmp_data_dir, dist, rtc, tag_df, target_tiles=[TILE])
+    _check_inputs(cli_runner, tmp_data_dir, tmp_path / 'out')
+    df_ck = pd.read_parquet(tmp_data_dir / INPUTS_CHECKPOINT_PARQUET)
+    assert target not in set(df_ck.opera_id)
+    assert set(df_ck.opera_id) == set(dist.opera_id) - {target}
+
+
+def test_f04_download_metadata_deletes_checkpoint(
+    tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dist, rtc, _ = _world()
+    seed_data_dir(tmp_data_dir, dist, rtc)
+    pd.DataFrame({'opera_id': ['x'], 'inputs_correct': [True]}).to_parquet(tmp_data_dir / INPUTS_CHECKPOINT_PARQUET)
+    monkeypatch.setattr(cmr, 'get_dist_s1_table', lambda *a, **k: dist)
+    monkeypatch.setattr(cmr, 'get_rtc_s1_table_with_lookback', lambda *a, **k: rtc)
+    result = _invoke(cli_runner, 'download-metadata', *JANUARY, '--data-dir', str(tmp_data_dir))
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert not (tmp_data_dir / INPUTS_CHECKPOINT_PARQUET).exists()
 
 
 # ---------------------------------------------------------------------------------------------------------------

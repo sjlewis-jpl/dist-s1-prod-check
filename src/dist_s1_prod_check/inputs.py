@@ -1,3 +1,5 @@
+import hashlib
+import json
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -8,6 +10,7 @@ from dist_s1_enumerator import enumerate_dist_s1_products, enumerate_one_dist_s1
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
+from dist_s1_prod_check import manifest
 from dist_s1_prod_check.constants import (
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
@@ -17,7 +20,7 @@ from dist_s1_prod_check.constants import (
 )
 from dist_s1_prod_check.ids import get_acq_timestamp, get_burst_id, get_opera_id_trunc, get_track_number
 from dist_s1_prod_check.network import OfflineError, network_allowed
-from dist_s1_prod_check.tags import MISSING_TAG_URL
+from dist_s1_prod_check.tags import MISSING_TAG_URL, TAG_COLUMNS
 
 
 N_S1_TRACKS = 175
@@ -232,6 +235,32 @@ def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.Ge
 RESULT_COLUMNS = ['opera_id', 'mgrs_tile_id', 'inputs_correct', 'issue_type', 'issue_value']
 
 
+def checkpoint_context(rtc_sha256: str, options: dict | None = None) -> str:
+    """Digest of everything besides a product's own tags that its inputs result depends on (F04).
+
+    Covers the RTC-S1 table (its parquet sha256), this tool's and the enumerator's versions, the enumeration
+    constants and `options` (e.g. mode and target tiles). A checkpoint row computed under another context is stale.
+    """
+    payload = {
+        'rtc_sha256': rtc_sha256,
+        'tool_version': manifest.tool_version(),
+        'enumerator_version': manifest.enumerator_version(),
+        'enumeration': [DELTA_LOOKBACK_DAYS, MAX_PRE_IMGS_PER_BURST, DELTA_WINDOW_DAYS, POST_DATE_BUFFER_SECONDS],
+        'options': options or {},
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def product_fingerprints(df_tags: pd.DataFrame, context: str) -> dict[str, str]:
+    """Fingerprint per product: sha256 of the checkpoint context and the product's tag row (incl. `source_url`)."""
+    cols = [c for c in [*TAG_COLUMNS, 'source_url'] if c in df_tags.columns]
+    rows = df_tags[cols].fillna('').astype(str)
+    return {
+        oid: hashlib.sha256('\x1f'.join([context, *values]).encode()).hexdigest()
+        for oid, values in zip(rows.opera_id, rows.itertuples(index=False, name=None))
+    }
+
+
 def _results_frame(records: list[dict]) -> pd.DataFrame:
     """Return result rows as a frame that keeps its columns when there are no rows (an empty universe)."""
     return pd.DataFrame(records) if records else pd.DataFrame(columns=RESULT_COLUMNS)
@@ -243,6 +272,7 @@ def check_inputs_offline(
     checkpoint_path: str | Path | None = None,
     workers: int = 1,
     checkpoint_every: int = 100,
+    context: str = '',
 ) -> pd.DataFrame:
     """Compare each product's recorded RTC inputs against an offline re-enumeration from the RTC-S1 table.
 
@@ -250,15 +280,29 @@ def check_inputs_offline(
     discards them after comparison, so peak memory is bounded by a single tile's inputs. With
     `checkpoint_path`, results are persisted every `checkpoint_every` tiles and prior results are
     reused, so interrupted runs resume instead of restarting.
+
+    Each checkpoint row stores its product's fingerprint (`product_fingerprints` under `context`, see
+    `checkpoint_context`). A product is reused only if its stored fingerprint equals the current one, so a changed
+    RTC-S1 table, tag row, tag source, tool or enumerator version, or option recomputes it (F04). Rows that could
+    not be checked (tag read error, enumeration error) are never written to the checkpoint, so they are always
+    recomputed. A checkpoint without fingerprints (written before this rule) is recomputed in full.
     """
+    fingerprints = product_fingerprints(df_tags, context)
     records: list[dict] = []
+    df_other = pd.DataFrame()
     done_opera: set[str] = set()
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
     if checkpoint_path and checkpoint_path.exists():
         df_ck = pd.read_parquet(checkpoint_path)
-        if 'opera_id' in df_ck.columns:
-            records = df_ck.to_dict('records')
-            done_opera = set(df_ck.opera_id)
+        if {'opera_id', 'fingerprint'} <= set(df_ck.columns):
+            current = df_ck.opera_id.map(fingerprints)
+            df_other = df_ck[current.isna()]  # other products' rows, kept as they are
+            df_mine = df_ck[current.notna()]
+            fresh = (df_mine.fingerprint == df_mine.opera_id.map(fingerprints)) & df_mine.inputs_correct.notna()
+            stale_products = set(df_mine.opera_id[~fresh])
+            df_reuse = df_mine[~df_mine.opera_id.isin(stale_products)]
+            records = df_reuse.drop(columns='fingerprint').to_dict('records')
+            done_opera = set(df_reuse.opera_id)
 
     requested_opera = set(df_tags.opera_id)
     df_todo = df_tags[~df_tags.opera_id.isin(done_opera)]
@@ -280,8 +324,12 @@ def check_inputs_offline(
     def _flush() -> None:
         if checkpoint_path is None:
             return
+        df_done = _results_frame(records)
+        df_done = df_done[df_done.inputs_correct.notna()]
+        df_done = df_done.assign(fingerprint=df_done.opera_id.map(fingerprints))
         tmp_path = checkpoint_path.with_suffix('.parquet.tmp')
-        _results_frame(records).to_parquet(tmp_path, compression='zstd')
+        df_out = pd.concat([df_other, df_done], ignore_index=True) if not df_other.empty else df_done
+        df_out.to_parquet(tmp_path, compression='zstd')
         tmp_path.replace(checkpoint_path)
 
     frame_groups = df_rtc_frame.groupby('mgrs_tile_id')

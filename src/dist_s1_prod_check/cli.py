@@ -486,6 +486,8 @@ def download_metadata(
 
     network.network_allowed('download-metadata')
     _check_venue(data_dir, venue)
+    # New metadata makes every checkpointed inputs result stale, as in run-all (F04).
+    (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
     bbox = tuple(bbox) if bbox else None
     dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
 
@@ -771,9 +773,12 @@ def _inputs_section(
     checkpoint_path: Path | None = None,
     state: SectionState = SectionState.COMPLETE,
     n_universe: int | None = None,
+    checkpoint_context: str = '',
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     if mode == 'offline':
-        df_results = inputs.check_inputs_offline(df_tags, df_frame, checkpoint_path=checkpoint_path, workers=workers)
+        df_results = inputs.check_inputs_offline(
+            df_tags, df_frame, checkpoint_path=checkpoint_path, workers=workers, context=checkpoint_context
+        )
     else:
         df_results = inputs.check_inputs_online(df_tags, max_workers=workers)
     if df_results.empty:
@@ -833,6 +838,13 @@ def _inputs_section(
         'inputs': df_results,
     }
     return sections, csvs
+
+
+def _inputs_checkpoint_context(m_rtc: manifest.TableManifest, frame_tiles: list[str] | None) -> str:
+    """Checkpoint context of the offline inputs check: RTC-S1 table, versions, mode and frame tiles (F04)."""
+    return inputs.checkpoint_context(
+        m_rtc.parquet_sha256, {'mode': 'offline', 'frame_tiles_sha256': manifest.target_tiles_sha(frame_tiles)}
+    )
 
 
 def _require_one_row_per_product(df: pd.DataFrame, universe: pd.Series, check: str, unique: bool = False) -> None:
@@ -1023,11 +1035,12 @@ def check_inputs(
             df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
             run.manifest.sampling['inputs'] = _sampling_record(n_universe, df_tags.opera_id, seed, 'products')
             state = SectionState.SAMPLED
-        df_frame = (
-            _build_rtc_frame(_load_rtc_checked(data_dir, run)[0], run, _load_target_tiles(data_dir))
-            if mode == 'offline'
-            else None
-        )
+        df_frame, context = None, ''
+        if mode == 'offline':
+            df_rtc, m_rtc = _load_rtc_checked(data_dir, run)
+            tiles = _load_target_tiles(data_dir)
+            df_frame = _build_rtc_frame(df_rtc, run, tiles)
+            context = _inputs_checkpoint_context(m_rtc, tiles)
         return _inputs_section(
             df_tags,
             df_frame,
@@ -1037,6 +1050,7 @@ def check_inputs(
             checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
             state=state,
             n_universe=n_universe,
+            checkpoint_context=context,
         )
 
     _run_single_check(out_dir, 'inputs', 'DIST-S1 product inputs', build, regression_baseline)
@@ -1257,6 +1271,7 @@ def run_all(
                 checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
                 state=tag_state,
                 n_universe=len(df_dedup),
+                checkpoint_context=_inputs_checkpoint_context(m_rtc, frame_tiles),
             ),
             'coverage': lambda: _coverage_section(
                 df_dedup, df_frame, start, stop, wkt_map, all_state, query_windows=m_rtc.lookback_windows
