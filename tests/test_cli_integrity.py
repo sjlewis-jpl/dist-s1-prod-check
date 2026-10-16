@@ -529,3 +529,19 @@ def test_f30_rtc_frame_drops_recorded(tmp_path: Path, tmp_data_dir: Path, cli_ru
     assert drops == {'single_polarization': 1, 'null_geometry': 1, 'not_in_lut': 1}
     html, _ = _report(out_dir)
     assert 'RTC-S1 rows dropped' in html and 'single polarization 1' in html
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# F20: orphans had no HTML section, and an empty orphans CSV had no header.
+
+
+def test_f20_orphans_section_and_empty_csv_header(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    seed_data_dir(tmp_data_dir, *_world(), target_tiles=[TILE])
+    out_dir = tmp_path / 'out'
+    result = _run_all(cli_runner, tmp_data_dir, out_dir)
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    _, data = _report(out_dir)
+    (orphans,) = [s for s in data['sections'] if s['key'] == 'orphans']
+    assert (orphans['n_universe'], orphans['n_unknown'], orphans['green']) == (3, 0, True)
+    (path,) = out_dir.glob('coverage_orphans_2*.csv')
+    assert path.read_text().splitlines()[0].startswith('opera_id,mgrs_tile_id'), path.read_text()[:80]

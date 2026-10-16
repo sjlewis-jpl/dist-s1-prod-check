@@ -1035,13 +1035,28 @@ def _coverage_section(
             'n_missing': int((df_cov.status == Status.FAIL).sum()),
         },
     )
+    if df_orphans.columns.empty:
+        df_orphans = pd.DataFrame(columns=coverage.ORPHAN_COLUMNS)  # keep the header in an empty CSV (F20)
+    df_orphans = _append_tile_wkt(df_orphans, wkt_map)
+    orphans = report.build_section(
+        'orphans',
+        'Orphan products',
+        'DIST-S1 products that the one-to-one assignment could not match to any expected RTC-S1 pass in the '
+        'window (UNKNOWN: the product cannot be accounted for by the RTC-S1 record), including a second product '
+        'within tolerance of a pass already matched to another product.',
+        df_orphans,
+        len(df_dedup) - len(df_orphans),
+        state=state,
+        n_universe=len(df_dedup),
+        counts={Status.PASS: len(df_dedup) - len(df_orphans), Status.UNKNOWN: len(df_orphans)},
+    )
     csvs = {
         'coverage_missing': df_missing,
         'coverage_missing_by_tile': df_by_tile,
         'coverage': df_cov,
         'coverage_orphans': df_orphans,
     }
-    return [section], csvs
+    return [section, orphans], csvs
 
 
 @cli.command()

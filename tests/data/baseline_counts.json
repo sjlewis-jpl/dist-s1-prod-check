@@ -71,6 +71,10 @@
       "ordering_first_production": {
         "n_checked": 599,
         "n_failures": 5
+      },
+      "orphans": {
+        "n_checked": 618,
+        "n_failures": 0
       }
     }
   },
@@ -150,6 +154,10 @@
       "ordering_first_production": {
         "n_checked": 563,
         "n_failures": 21
+      },
+      "orphans": {
+        "n_checked": 582,
+        "n_failures": 0
       }
     }
   }
