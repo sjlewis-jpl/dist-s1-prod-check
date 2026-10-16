@@ -219,6 +219,10 @@ def _check_products_against_expected(
     with that identity (F05). Matching is one-to-one: if several products claim one expected product, the closest
     in acquisition time wins (ties: smaller opera_id) and the others FAIL `Expected product already claimed`
     without an input comparison.
+
+    A product whose tags cannot be parsed or compared gets one UNKNOWN `Comparison error` row and takes no part in
+    claiming, so its tile neighbours are still checked (F22). Errors enumerating the tile are the caller's
+    (`_check_one_tile`: the whole tile is UNKNOWN `Enumeration error`).
     """
     index_by_tile = _expected_product_index(df_expected)
     expected_by_product = dict(tuple(df_expected.groupby('product_id')))
@@ -228,12 +232,16 @@ def _check_products_against_expected(
     records_by_product: dict[str, list[dict]] = {}
     for row in df_tags_tile.itertuples():
         tile = own_tile(row.opera_id)
-        acq = get_acq_timestamp(row.opera_id)
         base = {'opera_id': row.opera_id, 'mgrs_tile_id': tile}
-        df_actual = parse_actual_inputs(row.pre_rtc_opera_ids, row.post_rtc_opera_ids)
-        issues = _identity_issues(row.mgrs_tile_id, tile, acq, df_actual)
-        post_tracks = sorted(df_actual[df_actual.input_category == 'post'].track_number.unique().tolist())
-        match = _match_expected_product(index_by_tile.get(tile), acq, post_tracks)
+        try:
+            acq = get_acq_timestamp(row.opera_id)
+            df_actual = parse_actual_inputs(row.pre_rtc_opera_ids, row.post_rtc_opera_ids)
+            issues = _identity_issues(row.mgrs_tile_id, tile, acq, df_actual)
+            post_tracks = sorted(df_actual[df_actual.input_category == 'post'].track_number.unique().tolist())
+            match = _match_expected_product(index_by_tile.get(tile), acq, post_tracks)
+        except Exception as e:
+            records_by_product[row.opera_id] = [_record(base, 'UNKNOWN', 'Comparison error', _error_text(e))]
+            continue
         if match is None:
             no_match = _issue('No expected product found', f'tile={tile}; acq={acq}; post tracks={post_tracks}')
             records_by_product[row.opera_id] = _product_records(base, [*issues, no_match])
@@ -248,10 +256,14 @@ def _check_products_against_expected(
         if winner != opera_id:
             issues = [*issues, _issue('Expected product already claimed', f'claimed by {winner}')]
         else:
-            issues = [
-                *issues,
-                *compare_inputs(df_actual, expected_by_product[product_id], pol_by_opera_id=pol_by_opera_id),
-            ]
+            try:
+                issues = [
+                    *issues,
+                    *compare_inputs(df_actual, expected_by_product[product_id], pol_by_opera_id=pol_by_opera_id),
+                ]
+            except Exception as e:
+                records_by_product[opera_id] = [_record(base, 'UNKNOWN', 'Comparison error', _error_text(e))]
+                continue
         records_by_product[opera_id] = _product_records(base, issues)
     return [record for row in df_tags_tile.itertuples() for record in records_by_product[row.opera_id]]
 

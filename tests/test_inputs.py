@@ -2,6 +2,7 @@ import warnings
 
 import geopandas as gpd
 import pandas as pd
+import pytest
 
 from dist_s1_prod_check import inputs
 from dist_s1_prod_check.cmr import build_rtc_input_frame
@@ -109,3 +110,36 @@ def test_f05_claim_tie_goes_to_smaller_opera_id_and_status_column_set() -> None:
     loser = by_id[id_s1c]
     assert loser.issue_type.tolist() == ['Expected product already claimed']
     assert id_s1a in loser.issue_value.iloc[0] and loser.status.tolist() == ['FAIL']
+
+
+# F22: a malformed tag row must not turn its tile neighbours into an `Enumeration error`.
+def test_f22_malformed_tags_are_a_per_product_comparison_error() -> None:
+    frame = _rtc_frame()
+    id_a, id_b = dist_id(TILE, T_A, PROC), dist_id(TILE, T_B, PROC)
+    df_tags = make_tags(
+        [
+            {'opera_id': id_a, **_expected_inputs(frame, T_A)},
+            {'opera_id': id_b, 'pre_rtc_opera_ids': 'not-an-rtc-id', 'post_rtc_opera_ids': 'garbage'},
+        ]
+    )
+
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    assert df[df.opera_id == id_a].status.tolist() == ['PASS']
+    rows_b = df[df.opera_id == id_b]
+    assert rows_b.issue_type.tolist() == ['Comparison error'] and rows_b.status.tolist() == ['UNKNOWN']
+    assert rows_b.inputs_correct.isna().all()
+
+
+def test_f22_enumeration_error_stays_per_tile(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = _rtc_frame()
+    id_a, id_b = dist_id(TILE, T_A, PROC), dist_id(TILE, T_B, PROC)
+    df_tags = make_tags([{'opera_id': id_a, **_expected_inputs(frame, T_A)}, {'opera_id': id_b}])
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError('enumerator failed')
+
+    monkeypatch.setattr(inputs, 'enumerate_dist_s1_products', _boom)
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    assert df.issue_type.tolist() == ['Enumeration error'] * 2 and set(df.status) == {'UNKNOWN'}
