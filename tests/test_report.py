@@ -266,7 +266,6 @@ def big_report(tmp_path_factory: pytest.TempPathFactory) -> tuple[dict, str]:
 
 
 # aa2014f: map features are built from the 50,000 embedded records, so only tile 11SLT is drawn.
-@pytest.mark.xfail(strict=True, reason='F13: map is built from the truncated table and drops failing tiles')
 def test_f13_map_includes_tile_beyond_truncation(big_report: tuple[dict, str]) -> None:
     sec, _ = big_report
     assert sec['truncated']
@@ -275,7 +274,6 @@ def test_f13_map_includes_tile_beyond_truncation(big_report: tuple[dict, str]) -
 
 
 # aa2014f: only the generic '(table truncated; full results in the CSV ...)' note; no shown-of-total count.
-@pytest.mark.xfail(strict=True, reason='F13: truncated table/export is not labelled with how much was dropped')
 def test_f13_truncated_table_labelled_with_counts(big_report: tuple[dict, str]) -> None:
     _, html = big_report
     assert 'showing first 50,000 of 50,001' in html
@@ -301,3 +299,15 @@ def test_report_script_renders_tiles_and_sections(tmp_path: Path, leaflet: bool)
         assert ['geoJSON', 1] in page['mapCalls']
     else:
         assert 'Map unavailable' in page['elements']['map']['innerHTML']
+
+
+def test_f19_unmapped_failures_counted(tmp_path: Path) -> None:
+    from jsrender import render
+
+    df = pd.DataFrame({'opera_id': ['p0', 'p1', 'p2'], 'mgrs_tile_id': [TILE, '', '99ZZZ'], 'reason': 'bad'})
+    section = report.build_section('one', 'One', 'Failures.', df, 3)
+    out = report.write_html_report([section], _tile_geoms([TILE]), tmp_path / 'r.html')
+    sec = _payload(out)['sections'][0]
+    assert sec['n_unmapped'] == 2
+    assert sum(f['properties']['n_failures'] for f in sec['geojson']['features']) + sec['n_unmapped'] == 3
+    assert render(out, leaflet=True)['error'] is None

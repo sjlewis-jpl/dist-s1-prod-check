@@ -21,6 +21,19 @@ CHECK_COLORS = [
 
 MAX_EMBEDDED_ROWS = 50_000
 MAX_POPUP_PRODUCTS = 12
+# CSV (written by the CLI as `<name>_<stamp>.csv`) holding every failure row of each section, named when a table is
+# truncated; a section not listed here names its key.
+FAILURE_CSVS = {
+    'ordering_first_production': 'ordering_first_production_failures',
+    'ordering': 'ordering_failures',
+    'confirmation': 'confirmation_failures',
+    'inputs': 'inputs_failures',
+    'inputs_post': 'inputs_failures_post',
+    'inputs_pre': 'inputs_failures_pre',
+    'inputs_other': 'inputs_failures_other',
+    'coverage': 'coverage_missing',
+    'orphans': 'coverage_orphans',
+}
 
 
 def _verdict(state: SectionState, counts: dict[str, int], n_checked: int) -> str:
@@ -52,6 +65,7 @@ def build_section(
     counts: dict[str, int] | None = None,
     note: str = '',
     extra: dict[str, int] | None = None,
+    csv_name: str = '',
 ) -> dict:
     """Package one check's failures and counts for the HTML report.
 
@@ -63,13 +77,23 @@ def build_section(
     Units are explicit (F12): `n_failed` is the number of units with FAIL, `n_issues` the number of failure-table
     rows (a unit can have several), and `extra` adds section-specific counts (e.g. `n_eligible`, `n_groups`).
 
+    The map is built from the full failure frame, not the embedded table (F13): per tile, its failure count and up
+    to `MAX_POPUP_PRODUCTS` rows; rows without a tile are counted as `n_unmapped`. A truncated table carries
+    `truncation_note`, naming the CSV (`csv_name`, default `FAILURE_CSVS`) that holds every row.
+
     `summary` is an optional aggregate table `{'title', 'columns', 'records'}` rendered below the
     main table; clicking one of its rows filters the main table by the row's first cell.
     """
-    df = df_failures.drop(columns=[c for c in ['geometry'] if c in df_failures.columns])
-    truncated = len(df) > MAX_EMBEDDED_ROWS
-    df = df.head(MAX_EMBEDDED_ROWS)
+    df_full = df_failures.drop(columns=[c for c in ['geometry'] if c in df_failures.columns])
+    truncated = len(df_full) > MAX_EMBEDDED_ROWS
+    df = df_full.head(MAX_EMBEDDED_ROWS)
     records = json.loads(df.to_json(orient='records', date_format='iso', default_handler=str))
+    tiles, n_unmapped = _tile_summary(df_full)
+    truncation_note = (
+        f'showing first {MAX_EMBEDDED_ROWS:,} of {len(df_full):,}; full list in {csv_name or FAILURE_CSVS.get(key, key)}_<stamp>.csv'
+        if truncated
+        else ''
+    )
     n_universe = n_checked + n_skipped if n_universe is None else n_universe
     if counts is None:
         n_fail = len(df_failures)
@@ -96,30 +120,44 @@ def build_section(
         'n_issues': int(len(df_failures)),
         **{k: int(v) for k, v in (extra or {}).items()},
         'truncated': truncated,
+        'truncation_note': truncation_note,
+        'tiles': tiles,
+        'n_unmapped': n_unmapped,
         'columns': df.columns.tolist(),
         'records': records,
         'summary': summary,
     }
 
 
-def _tile_features(section: dict, tile_geoms: gpd.GeoDataFrame) -> list[dict]:
-    df = pd.DataFrame(section['records'])
+def _tile_summary(df: pd.DataFrame) -> tuple[dict[str, dict], int]:
+    """Per tile of the full failure frame: its row count and first popup rows; and the rows with no tile."""
     if df.empty or 'mgrs_tile_id' not in df.columns:
-        return []
+        return {}, int(len(df))
+    has_tile = df.mgrs_tile_id.notna() & (df.mgrs_tile_id.astype(str) != '')
+    tiles = {}
+    for tile, group in df[has_tile].groupby('mgrs_tile_id', sort=True):
+        popup = group.head(MAX_POPUP_PRODUCTS)
+        products = json.loads(popup.to_json(orient='records', date_format='iso', default_handler=str))
+        tiles[str(tile)] = {'n_failures': int(len(group)), 'products': products}
+    return tiles, int((~has_tile).sum())
+
+
+def _tile_features(section: dict, tile_geoms: gpd.GeoDataFrame) -> tuple[list[dict], int]:
+    """Map features of a section's failing tiles, and the failure rows that cannot be mapped (F13, F19)."""
     geom_by_tile = tile_geoms.set_index('mgrs_tile_id').geometry
-    features = []
-    for tile, group in df.groupby('mgrs_tile_id'):
-        if tile not in geom_by_tile.index:
+    features, n_unmapped = [], section.get('n_unmapped', 0)
+    for tile, info in section.get('tiles', {}).items():
+        if tile not in geom_by_tile.index or geom_by_tile[tile] is None:
+            n_unmapped += info['n_failures']
             continue
-        products = group.head(MAX_POPUP_PRODUCTS).to_dict('records')
         features.append(
             {
                 'type': 'Feature',
                 'geometry': geom_by_tile[tile].__geo_interface__,
-                'properties': {'mgrs_tile_id': tile, 'n_failures': int(len(group)), 'products': products},
+                'properties': {'mgrs_tile_id': tile, 'n_failures': info['n_failures'], 'products': info['products']},
             }
         )
-    return features
+    return features, n_unmapped
 
 
 def _banner_html(run_status: dict) -> str:
@@ -251,16 +289,19 @@ def write_html_report(
         'title': title,
         'subtitle': subtitle,
         'run_status': run_status or {'state': 'COMPLETE', 'failed_check': None, 'error': None, 'not_run': []},
-        'sections': [
+        'sections': [],
+    }
+    for i, section in enumerate(sections):
+        features, n_unmapped = _tile_features(section, tile_geoms)
+        payload['sections'].append(
             {
-                **section,
+                **{k: v for k, v in section.items() if k != 'tiles'},
+                'n_unmapped': n_unmapped,
                 'colorLight': CHECK_COLORS[i % len(CHECK_COLORS)][0],
                 'colorDark': CHECK_COLORS[i % len(CHECK_COLORS)][1],
-                'geojson': {'type': 'FeatureCollection', 'features': _tile_features(section, tile_geoms)},
+                'geojson': {'type': 'FeatureCollection', 'features': features},
             }
-            for i, section in enumerate(sections)
-        ],
-    }
+        )
     data_js = json.dumps(payload, default=str).replace('</', '<\\/')
     html = (
         _TEMPLATE.replace('__TITLE__', title)
@@ -433,7 +474,7 @@ DATA.sections.forEach((sec, i) => {
     </div>` : '';
   el.innerHTML = `
     <h2><span class="swatch" style="background:${color};width:11px;height:11px;border-radius:3px;display:inline-block"></span>${esc(sec.title)}</h2>
-    <div class="desc">${esc(sec.description)}${sec.truncated ? ' (table truncated; full results in the CSV written alongside this report)' : ''}</div>
+    <div class="desc">${esc(sec.description)}${sec.truncated ? ' (' + esc(sec.truncation_note) + ')' : ''}</div>
     <div class="desc"><b>${esc(sec.state)}</b> &middot; ${sec.n_failed.toLocaleString()} failed of ${sec.n_checked.toLocaleString()} checked (${esc(sec.unit)}); universe ${sec.n_universe.toLocaleString()}, ${sec.n_skipped.toLocaleString()} skipped &middot; ${countText(sec)} &middot; ${esc(sec.verdict)}${sec.note ? ' &middot; ' + esc(sec.note) : ''}</div>
     ${sec.records.length === 0 ? `<div class="${sec.green ? 'empty' : 'empty na'}">${esc(sec.verdict)}</div>` : `
     <div class="controls">
@@ -541,7 +582,8 @@ if (window.L) {
       const b = layer.getBounds();
       allBounds = allBounds ? allBounds.extend(b) : b;
     }
-    overlays[`<span style="color:${color}">&#9632;</span> ${esc(sec.title)} (${sec.n_failures})`] = layer;
+    const unmapped = sec.n_unmapped ? `; ${sec.n_unmapped.toLocaleString()} failures without a tile` : '';
+    overlays[`<span style="color:${color}">&#9632;</span> ${esc(sec.title)} (${sec.n_failures.toLocaleString()}${unmapped})`] = layer;
   });
   if (allBounds) map.fitBounds(allBounds, {padding: [20, 20]});
   L.control.layers(null, overlays, {collapsed: false}).addTo(map);
