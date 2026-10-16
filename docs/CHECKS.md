@@ -33,6 +33,10 @@ an older, readable version.
   are read.
 - A CMR query that returned as many rows as `CMR-Hits` was paged to the end; that does not prove the archive itself
   is complete.
+- Sampling is not for the gate: `--sample-tiles` draws only from tiles that have DIST-S1 products, so a tile with
+  no products at all can never be sampled and its missing passes are never seen (F29).
+- AOI runs (`--bbox`) query DIST-S1 CMR with the raw bbox, not the MGRS tile geometry (F32, speculative); the
+  RTC-S1 query is widened to the tiles' full burst footprints.
 - Network paths (CMR paging and response validation, chunk manifests, the OPS-POP1 S3 listing, live tag reads and
   retries, online inputs mode) are validated with mocked responses only, not against a live venue.
 
@@ -111,7 +115,10 @@ Two views (decision 2):
   with a fingerprint of the RTC table, the tag row (including its source URL), tool and enumerator versions and
   options; error rows are never checkpointed (F04). `--mode online` queries ASF per product (enumerating once per
   post track); validated with mocks only.
-- **Limits:** acquisition identity decides pass/fail; RTC processing versions are informational only.
+- **Limits:** acquisition identity decides pass/fail; RTC processing versions are informational only. The offline
+  re-enumeration uses today's RTC-S1 table, not the archive snapshot production saw when it ran (F27): an RTC
+  granule ingested after the product was made can appear as "expected but not found" (7 of 133 pop1 post failures
+  at review time). Do not "fix" this by filtering on processing time, which is not ingestion time.
 
 ## 5. Coverage (`coverage`) and orphans (`orphans`)
 

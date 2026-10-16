@@ -57,7 +57,8 @@ Then, before reading any count:
 
 **Never use sampling for the gate.** `--sample-tiles N` (every check on N random tiles, full time series) and
 `--sample-inputs N` (confirmation and inputs on N products) are for fast iteration. Sampled sections are labelled
-SAMPLED with the sample size, seed and a digest of the selected ids in the provenance.
+SAMPLED with the sample size, seed and a digest of the selected ids in the provenance. `--sample-tiles` can never
+select a tile with no DIST-S1 products, so it cannot show a tile the system skipped entirely.
 
 ## Caches and manifests
 
