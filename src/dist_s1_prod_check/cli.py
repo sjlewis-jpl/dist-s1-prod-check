@@ -17,6 +17,7 @@ from dist_s1_prod_check.constants import (
     VENUES,
     VENUE_FILE,
 )
+from dist_s1_prod_check.status import EVALUATED, SectionState, Status
 
 
 def _stamp() -> str:
@@ -365,7 +366,7 @@ def _issue_summary(df_bad: pd.DataFrame) -> dict | None:
 
 
 def _duplicates_section(
-    df_dist: gpd.GeoDataFrame, wkt_map: dict[str, str]
+    df_dist: gpd.GeoDataFrame, wkt_map: dict[str, str], state: SectionState = SectionState.COMPLETE
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_dup = _append_tile_wkt(checks.check_duplicates(df_dist), wkt_map)
     section = report.build_section(
@@ -375,14 +376,18 @@ def _duplicates_section(
         'each group is taken as the correct one; every other check runs on that granule only.',
         df_dup,
         len(df_dist),
+        state=state,
     )
     return [section], {'duplicates': df_dup}
 
 
-def _ordering_section(df_dedup: pd.DataFrame, wkt_map: dict[str, str]) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+def _ordering_section(
+    df_dedup: pd.DataFrame, wkt_map: dict[str, str], state: SectionState = SectionState.COMPLETE
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_order = checks.check_processing_order(df_dedup)
     df_bad = _append_tile_wkt(df_order[df_order.out_of_order], wkt_map)
     n_reprocessed = int(df_order.is_reprocessed.sum())
+    n_evaluated = int(df_order.evaluated.sum())
     section = report.build_section(
         'ordering',
         'Processing order',
@@ -390,23 +395,40 @@ def _ordering_section(df_dedup: pd.DataFrame, wkt_map: dict[str, str]) -> tuple[
         f'check: {n_reprocessed} reprocessed acquisitions (see Duplicates - their retained version is '
         'processed late by construction) and the first evaluated product of each tile.',
         df_bad,
-        int(df_order.evaluated.sum()),
+        n_evaluated,
+        state=state,
+        n_universe=len(df_order),
+        n_skipped=len(df_order) - n_evaluated,
     )
     return [section], {'ordering_failures': df_bad, 'ordering': df_order}
 
 
 def _confirmation_section(
-    df_dedup: pd.DataFrame, df_tags: pd.DataFrame, expect_none_at_start: bool, wkt_map: dict[str, str]
+    df_dedup: pd.DataFrame,
+    df_tags: pd.DataFrame,
+    expect_none_at_start: bool,
+    wkt_map: dict[str, str],
+    state: SectionState = SectionState.COMPLETE,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_conf = checks.check_confirmation(df_dedup, df_tags, expect_none_at_start=expect_none_at_start)
     df_conf = df_conf[df_conf.opera_id.isin(df_tags.opera_id)]
     df_bad = _append_tile_wkt(df_conf[~df_conf.confirmed_ok], wkt_map)
+    # A first-in-window product has no predecessor to compare against unless the window starts the mission.
+    skipped = df_conf.is_first_in_window & ~df_conf.tag_missing & (not expect_none_at_start)
+    n_skipped = int(skipped.sum())
+    n_fail = int((~df_conf.confirmed_ok).sum())
     section = report.build_section(
         'confirmation',
         'Confirmation chain',
-        'Products whose prior_dist_s1_product tag does not point to the previous product in the tile time series.',
+        'Products whose prior_dist_s1_product tag does not point to the previous product in the tile time series. '
+        'The first product of each tile in the window has no predecessor to check and is skipped unless '
+        '--expect-none-at-start is set.',
         df_bad,
-        len(df_conf),
+        len(df_conf) - n_skipped,
+        state=state,
+        n_universe=len(df_dedup),
+        n_skipped=n_skipped,
+        counts={Status.PASS: len(df_conf) - n_skipped - n_fail, Status.FAIL: n_fail},
     )
     tiles = checks.summarize_by_tile(df_conf.assign(fail=~df_conf.confirmed_ok), 'fail')
     return [section], {'confirmation_failures': df_bad, 'confirmation_tiles': tiles}
@@ -419,13 +441,26 @@ def _inputs_section(
     workers: int,
     wkt_map: dict[str, str],
     checkpoint_path: Path | None = None,
+    state: SectionState = SectionState.COMPLETE,
+    n_universe: int | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     if mode == 'offline':
         df_results = inputs.check_inputs_offline(df_tags, df_frame, checkpoint_path=checkpoint_path, workers=workers)
     else:
         df_results = inputs.check_inputs_online(df_tags, max_workers=workers)
+    if df_results.empty:
+        df_results = pd.DataFrame(columns=inputs.RESULT_COLUMNS)
     df_bad = _append_tile_wkt(df_results[df_results.inputs_correct != True], wkt_map)  # noqa: E712
-    n_checked = df_results.opera_id.nunique()
+    product_status = _inputs_product_status(df_results)
+    counts = product_status.value_counts().to_dict()
+    n_checked = int(product_status.isin(EVALUATED).sum())
+    n_universe = len(product_status) if n_universe is None else n_universe
+
+    def _counts(df_subset: pd.DataFrame) -> dict[str, int]:
+        n_bad = df_subset.opera_id.nunique()
+        return {Status.FAIL: n_bad, Status.PASS: max(n_checked - n_bad, 0)}
+
+    common = {'state': state, 'n_universe': n_universe}
 
     post_mask = df_bad.issue_type.str.contains('Post', case=False)
     pre_mask = df_bad.issue_type.str.contains('Pre', case=False) & ~post_mask
@@ -437,6 +472,8 @@ def _inputs_section(
             df_bad,
             n_checked,
             summary=_issue_summary(df_bad),
+            counts=counts,
+            **common,
         ),
         report.build_section(
             'inputs_post',
@@ -445,6 +482,8 @@ def _inputs_section(
             df_bad[post_mask],
             n_checked,
             summary=_issue_summary(df_bad[post_mask]),
+            counts=_counts(df_bad[post_mask]),
+            **common,
         ),
         report.build_section(
             'inputs_pre',
@@ -453,6 +492,8 @@ def _inputs_section(
             df_bad[pre_mask],
             n_checked,
             summary=_issue_summary(df_bad[pre_mask]),
+            counts=_counts(df_bad[pre_mask]),
+            **common,
         ),
     ]
     csvs = {
@@ -464,8 +505,22 @@ def _inputs_section(
     return sections, csvs
 
 
+def _inputs_product_status(df_results: pd.DataFrame) -> pd.Series:
+    """One status per product: UNKNOWN if any row could not be checked, else FAIL if any row failed, else PASS."""
+    if df_results.empty:
+        return pd.Series(dtype=str)
+    value = df_results.inputs_correct.map({True: Status.PASS, False: Status.FAIL}).fillna(Status.UNKNOWN)
+    rank = value.map({Status.UNKNOWN: 0, Status.FAIL: 1, Status.PASS: 2})
+    return value.groupby(df_results.opera_id).agg(lambda v: v.loc[rank[v.index].idxmin()])
+
+
 def _coverage_section(
-    df_dedup: pd.DataFrame, df_frame: gpd.GeoDataFrame, start: str, stop: str, wkt_map: dict[str, str]
+    df_dedup: pd.DataFrame,
+    df_frame: gpd.GeoDataFrame,
+    start: str,
+    stop: str,
+    wkt_map: dict[str, str],
+    state: SectionState = SectionState.COMPLETE,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_groups = coverage.expected_pass_groups(df_frame, start, stop)
     df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame)
@@ -475,6 +530,7 @@ def _coverage_section(
         _vertex_search_url(row.mgrs_tile_wkt, row.post_acq_dt) for row in df_missing.itertuples()
     ]
     df_orphans = coverage.check_orphan_products(df_groups, df_dedup)
+    n_found = int(df_cov.product_found.sum()) if len(df_cov) else 0
 
     summary = None
     df_by_tile = pd.DataFrame(columns=['mgrs_tile_id', 'n_missing', 'missing_post_dates'])
@@ -498,8 +554,13 @@ def _coverage_section(
         'Coverage',
         'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none.',
         df_missing,
-        len(df_cov),
+        n_found + len(df_missing),
         summary=summary,
+        state=state,
+        unit='passes',
+        n_universe=len(df_cov),
+        n_skipped=len(df_cov) - n_found - len(df_missing),
+        counts={Status.PASS: n_found, Status.FAIL: len(df_missing)},
     )
     csvs = {
         'coverage_missing': df_missing,

@@ -62,7 +62,6 @@ def _chain_tags(ids: list[str]) -> list[dict]:
 
 # aa2014f: duplicates/ordering/confirmation get n_checked=0, n_failures=0, no state -> green; run-all then exits 1
 # (AttributeError in the inputs section on the empty universe), so the report lacks inputs/coverage.
-@pytest.mark.xfail(strict=True, reason='F11: --processing-start after every product gives green "No failures" sections')
 def test_f11_processing_start_after_all_products_gives_empty_sections(
     tmp_data_dir: Path, tmp_path: Path, cli_runner: CliRunner
 ) -> None:
@@ -104,7 +103,6 @@ def _confirmation_html(df_dist: gpd.GeoDataFrame, df_tags: pd.DataFrame, tmp_pat
 
 
 # aa2014f: n_checked=100 (all first-in-window), n_failures=0 -> green, no 'not evaluated' anywhere in the HTML.
-@pytest.mark.xfail(strict=True, reason='F11: all-SKIPPED confirmation section is shown green as checked')
 def test_f11_all_skipped_confirmation_is_not_evaluated(tmp_path: Path) -> None:
     tiles = sorted(get_mgrs_table().mgrs_tile_id)[:100]
     ids = [dist_id(t, ACQ0, ACQ0 + pd.Timedelta(hours=6)) for t in tiles]
@@ -119,7 +117,6 @@ def test_f11_all_skipped_confirmation_is_not_evaluated(tmp_path: Path) -> None:
 
 
 # aa2014f: n_checked=13 (skips counted as checked) and the section has no n_skipped.
-@pytest.mark.xfail(strict=True, reason='F11: skipped items are counted as checked')
 def test_f11_evaluated_plus_skipped_is_green_with_split_counts(tmp_path: Path) -> None:
     ids = _chain('11SLT', 5) + _chain('11SLU', 4) + _chain('11SKT', 4)
     tags = make_tags(_chain_tags(ids[:5]) + _chain_tags(ids[5:9]) + _chain_tags(ids[9:]))
@@ -128,6 +125,24 @@ def test_f11_evaluated_plus_skipped_is_green_with_split_counts(tmp_path: Path) -
     assert _is_green(sec)
     assert sec['n_checked'] == 10
     assert sec.get('n_skipped') == 3
+
+
+# --- F21 -------------------------------------------------------------------------------------------------------------
+
+
+def test_f21_map_initialised_last_and_only_with_leaflet(tmp_path: Path) -> None:
+    df = pd.DataFrame({'opera_id': ['p0'], 'mgrs_tile_id': [TILE], 'reason': ['bad']})
+    section = report.build_section('one', 'One', 'One failure.', df, 1)
+    html = report.write_html_report([section], _tile_geoms([TILE]), tmp_path / 'r.html').read_text()
+    script = html[html.index('const DATA = ') :]
+    map_at = script.index('L.map(')
+    assert script.count('L.map(') == 1
+    guard_at = script.index('if (window.L) {')
+    assert guard_at < map_at < script.index('} else {', guard_at)
+    assert 'showMapUnavailable()' in script[script.index('} else {', guard_at) :]
+    # Stat tiles and section tables are rendered before the map is touched.
+    for marker in ("tilesDiv.insertAdjacentHTML('beforeend'", 'sectionsDiv.appendChild(el)'):
+        assert script.index(marker) < guard_at, marker
 
 
 # --- F12 -------------------------------------------------------------------------------------------------------------

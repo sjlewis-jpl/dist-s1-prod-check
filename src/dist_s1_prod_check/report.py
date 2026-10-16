@@ -5,6 +5,8 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 
+from dist_s1_prod_check.status import SectionState, Status, is_green
+
 
 CHECK_COLORS = [
     ('#2a78d6', '#3987e5'),
@@ -21,6 +23,20 @@ MAX_EMBEDDED_ROWS = 50_000
 MAX_POPUP_PRODUCTS = 12
 
 
+def _verdict(state: SectionState, counts: dict[str, int], n_checked: int) -> str:
+    """One-line verdict shown on a section's stat tile and header."""
+    n_fail, n_unknown = counts.get(Status.FAIL, 0), counts.get(Status.UNKNOWN, 0)
+    if state == SectionState.EMPTY:
+        return 'empty: nothing to check'
+    if n_fail or n_unknown:
+        return f'{n_fail:,} failed, {n_unknown:,} unknown'
+    if n_checked == 0:
+        return 'not evaluated: insufficient evidence'
+    if state == SectionState.SAMPLED:
+        return 'no failures in the sample'
+    return 'no failures'
+
+
 def build_section(
     key: str,
     title: str,
@@ -28,8 +44,20 @@ def build_section(
     df_failures: pd.DataFrame,
     n_checked: int,
     summary: dict | None = None,
+    *,
+    state: SectionState = SectionState.COMPLETE,
+    unit: str = 'products',
+    n_universe: int | None = None,
+    n_skipped: int = 0,
+    counts: dict[str, int] | None = None,
+    note: str = '',
 ) -> dict:
-    """Package one check's failures for the HTML report.
+    """Package one check's failures and counts for the HTML report.
+
+    `n_checked` counts the units actually evaluated (PASS + FAIL + INFO), `n_skipped` those deliberately not
+    evaluated, and `n_universe` every unit the section should cover (default `n_checked + n_skipped`). `counts`
+    maps each `Status` to a unit count; by default every failure row is one FAIL and the other checked units PASS.
+    A COMPLETE section with an empty universe becomes EMPTY. The section is green only under `status.is_green`.
 
     `summary` is an optional aggregate table `{'title', 'columns', 'records'}` rendered below the
     main table; clicking one of its rows filters the main table by the row's first cell.
@@ -38,11 +66,26 @@ def build_section(
     truncated = len(df) > MAX_EMBEDDED_ROWS
     df = df.head(MAX_EMBEDDED_ROWS)
     records = json.loads(df.to_json(orient='records', date_format='iso', default_handler=str))
+    n_universe = n_checked + n_skipped if n_universe is None else n_universe
+    if counts is None:
+        n_fail = len(df_failures)
+        counts = {Status.PASS: max(n_checked - n_fail, 0), Status.FAIL: n_fail}
+    counts = {str(Status(k)): int(v) for k, v in counts.items() if v}
+    if state == SectionState.COMPLETE and n_universe == 0:
+        state = SectionState.EMPTY
     return {
         'key': key,
         'title': title,
         'description': description,
+        'state': str(state),
+        'unit': unit,
+        'n_universe': int(n_universe),
         'n_checked': int(n_checked),
+        'n_skipped': int(n_skipped),
+        'counts': counts,
+        'green': is_green(state, counts, n_checked),
+        'verdict': _verdict(state, counts, n_checked),
+        'note': note,
         'n_failures': int(len(df_failures)),
         'truncated': truncated,
         'columns': df.columns.tolist(),
@@ -193,6 +236,7 @@ _TEMPLATE = r"""<!doctype html>
   .banner { background: var(--critical); color: #fff; border-radius: 10px; padding: 12px 16px; margin-top: 14px;
             font-size: 0.95rem; }
   .tile.grey { opacity: 0.75; } .tile .value.na { color: var(--muted); }
+  .empty.na { color: var(--muted); }
   .empty { color: var(--good); font-size: 0.9rem; padding: 8px 0; }
   .leaflet-popup-content { font: 0.78rem system-ui, sans-serif; max-height: 260px; overflow-y: auto; }
   .leaflet-popup-content b { font-size: 0.85rem; }
@@ -217,59 +261,19 @@ document.getElementById('subtitle').textContent = DATA.subtitle;
 
 const RS = DATA.run_status;
 
-const map = L.map('map', {worldCopyJump: true}).setView([15, 0], 2);
-L.tileLayer(
-  // Esri gray canvas: keyless (CARTO basemaps now require an API key).
-  'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_' + (dark ? 'Dark' : 'Light') + '_Gray_Base/MapServer/tile/{z}/{y}/{x}',
-  {attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ', maxZoom: 16}
-).addTo(map);
-
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-}
-function isUrl(v) { return typeof v === 'string' && v.startsWith('https://'); }
-
-const overlays = {};
-let allBounds = null;
-DATA.sections.forEach(sec => {
-  const color = dark ? sec.colorDark : sec.colorLight;
-  const layer = L.geoJSON(sec.geojson, {
-    style: {color: color, weight: 1.5, fillColor: color, fillOpacity: 0.35},
-    onEachFeature: (feat, lyr) => {
-      const p = feat.properties;
-      let html = `<b>${esc(p.mgrs_tile_id)}</b> &mdash; ${esc(sec.title)}<br>${p.n_failures} flagged`;
-      p.products.forEach(prod => {
-        html += `<div class="prod">`;
-        Object.entries(prod).forEach(([k, v]) => {
-          if (v === null || v === '' || k === 'mgrs_tile_id') return;
-          html += isUrl(v) ? `<div><a href="${esc(v)}" target="_blank">${esc(k)}</a></div>`
-                           : `<div><b>${esc(k)}:</b> ${esc(v)}</div>`;
-        });
-        html += `</div>`;
-      });
-      if (p.n_failures > p.products.length) html += `<div class="prod">&hellip; ${p.n_failures - p.products.length} more (see table)</div>`;
-      lyr.bindPopup(html, {maxWidth: 420});
-    },
-  });
-  if (sec.geojson.features.length) {
-    layer.addTo(map);
-    const b = layer.getBounds();
-    allBounds = allBounds ? allBounds.extend(b) : b;
-  }
-  overlays[`<span style="color:${color}">&#9632;</span> ${esc(sec.title)} (${sec.n_failures})`] = layer;
-});
-if (allBounds) map.fitBounds(allBounds, {padding: [20, 20]});
-L.control.layers(null, overlays, {collapsed: false}).addTo(map);
 
 const tilesDiv = document.getElementById('tiles');
 DATA.sections.forEach(sec => {
   const color = dark ? sec.colorDark : sec.colorLight;
-  const cls = sec.n_failures === 0 ? 'ok' : 'bad';
+  const bad = (sec.counts.FAIL || 0) + (sec.counts.UNKNOWN || 0) > 0;
+  const cls = sec.green ? 'ok' : (bad ? 'bad' : 'na');
+  const skipped = sec.n_skipped ? `, ${sec.n_skipped.toLocaleString()} skipped` : '';
   tilesDiv.insertAdjacentHTML('beforeend', `
-    <div class="tile">
+    <div class="tile${cls === 'na' ? ' grey' : ''}">
       <div class="label"><span class="swatch" style="background:${color}"></span>${esc(sec.title)}</div>
       <div class="value ${cls}">${sec.n_failures.toLocaleString()}</div>
-      <div class="sub">flagged of ${sec.n_checked.toLocaleString()} checked</div>
+      <div class="sub">flagged of ${sec.n_checked.toLocaleString()} ${esc(sec.unit)} checked${skipped}</div>
+      <div class="sub">${esc(sec.state)} &middot; universe ${sec.n_universe.toLocaleString()} &middot; ${esc(sec.verdict)}</div>
     </div>`);
 });
 
@@ -308,7 +312,8 @@ DATA.sections.forEach((sec, i) => {
   el.innerHTML = `
     <h2><span class="swatch" style="background:${color};width:11px;height:11px;border-radius:3px;display:inline-block"></span>${esc(sec.title)}</h2>
     <div class="desc">${esc(sec.description)}${sec.truncated ? ' (table truncated; full results in the CSV written alongside this report)' : ''}</div>
-    ${sec.records.length === 0 ? '<div class="empty">No failures.</div>' : `
+    <div class="desc"><b>${esc(sec.state)}</b> &middot; ${sec.n_checked.toLocaleString()} of ${sec.n_universe.toLocaleString()} ${esc(sec.unit)} checked, ${sec.n_skipped.toLocaleString()} skipped &middot; ${esc(sec.verdict)}${sec.note ? ' &middot; ' + esc(sec.note) : ''}</div>
+    ${sec.records.length === 0 ? `<div class="${sec.green ? 'empty' : 'empty na'}">${esc(sec.verdict)}</div>` : `
     <div class="controls">
       <input type="search" placeholder="Filter rows&hellip;" id="filter-${i}">
       <button id="csv-${i}">Download CSV</button>
@@ -371,6 +376,61 @@ DATA.sections.forEach((sec, i) => {
     URL.revokeObjectURL(a.href);
   });
 });
+
+function showMapUnavailable() {
+  document.getElementById('map').innerHTML =
+    '<div class="empty" style="padding:16px;color:var(--muted)">Map unavailable (Leaflet could not be loaded). ' +
+    'Counts and tables above and below are unaffected.</div>';
+}
+
+// The map is drawn last and only if Leaflet loaded, so a blocked CDN never hides counts or tables.
+if (window.L) {
+  const map = L.map('map', {worldCopyJump: true}).setView([15, 0], 2);
+  L.tileLayer(
+    // Esri gray canvas: keyless (CARTO basemaps now require an API key).
+    'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_' + (dark ? 'Dark' : 'Light') + '_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+    {attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ', maxZoom: 16}
+  ).addTo(map);
+
+  function esc(s) {
+    return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  }
+  function isUrl(v) { return typeof v === 'string' && v.startsWith('https://'); }
+
+  const overlays = {};
+  let allBounds = null;
+  DATA.sections.forEach(sec => {
+    const color = dark ? sec.colorDark : sec.colorLight;
+    const layer = L.geoJSON(sec.geojson, {
+      style: {color: color, weight: 1.5, fillColor: color, fillOpacity: 0.35},
+      onEachFeature: (feat, lyr) => {
+        const p = feat.properties;
+        let html = `<b>${esc(p.mgrs_tile_id)}</b> &mdash; ${esc(sec.title)}<br>${p.n_failures} flagged`;
+        p.products.forEach(prod => {
+          html += `<div class="prod">`;
+          Object.entries(prod).forEach(([k, v]) => {
+            if (v === null || v === '' || k === 'mgrs_tile_id') return;
+            html += isUrl(v) ? `<div><a href="${esc(v)}" target="_blank">${esc(k)}</a></div>`
+                             : `<div><b>${esc(k)}:</b> ${esc(v)}</div>`;
+          });
+          html += `</div>`;
+        });
+        if (p.n_failures > p.products.length) html += `<div class="prod">&hellip; ${p.n_failures - p.products.length} more (see table)</div>`;
+        lyr.bindPopup(html, {maxWidth: 420});
+      },
+    });
+    if (sec.geojson.features.length) {
+      layer.addTo(map);
+      const b = layer.getBounds();
+      allBounds = allBounds ? allBounds.extend(b) : b;
+    }
+    overlays[`<span style="color:${color}">&#9632;</span> ${esc(sec.title)} (${sec.n_failures})`] = layer;
+  });
+  if (allBounds) map.fitBounds(allBounds, {padding: [20, 20]});
+  L.control.layers(null, overlays, {collapsed: false}).addTo(map);
+} else {
+  showMapUnavailable();
+}
 </script>
 </body>
 </html>

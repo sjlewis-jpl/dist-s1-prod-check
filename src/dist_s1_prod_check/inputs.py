@@ -227,6 +227,14 @@ def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.Ge
         ]
 
 
+RESULT_COLUMNS = ['opera_id', 'mgrs_tile_id', 'inputs_correct', 'issue_type', 'issue_value']
+
+
+def _results_frame(records: list[dict]) -> pd.DataFrame:
+    """Return result rows as a frame that keeps its columns when there are no rows (an empty universe)."""
+    return pd.DataFrame(records) if records else pd.DataFrame(columns=RESULT_COLUMNS)
+
+
 def check_inputs_offline(
     df_tags: pd.DataFrame,
     df_rtc_frame: gpd.GeoDataFrame,
@@ -246,8 +254,9 @@ def check_inputs_offline(
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
     if checkpoint_path and checkpoint_path.exists():
         df_ck = pd.read_parquet(checkpoint_path)
-        records = df_ck.to_dict('records')
-        done_opera = set(df_ck.opera_id)
+        if 'opera_id' in df_ck.columns:
+            records = df_ck.to_dict('records')
+            done_opera = set(df_ck.opera_id)
 
     requested_opera = set(df_tags.opera_id)
     df_todo = df_tags[~df_tags.opera_id.isin(done_opera)]
@@ -270,7 +279,7 @@ def check_inputs_offline(
         if checkpoint_path is None:
             return
         tmp_path = checkpoint_path.with_suffix('.parquet.tmp')
-        pd.DataFrame(records).to_parquet(tmp_path, compression='zstd')
+        _results_frame(records).to_parquet(tmp_path, compression='zstd')
         tmp_path.replace(checkpoint_path)
 
     frame_groups = df_rtc_frame.groupby('mgrs_tile_id')
@@ -310,7 +319,7 @@ def check_inputs_offline(
                         pbar.update(1)
                     _flush()
     _flush()
-    df = pd.DataFrame(records)
+    df = _results_frame(records)
     return df[df.opera_id.isin(requested_opera)].reset_index(drop=True)
 
 

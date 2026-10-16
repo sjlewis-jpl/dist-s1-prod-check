@@ -4,6 +4,22 @@ import pandas as pd
 from dist_s1_prod_check.constants import DELTA_LOOKBACK_DAYS, DELTA_WINDOW_DAYS, DUAL_POLARIZATIONS
 
 
+COVERAGE_COLUMNS = [
+    'mgrs_tile_id',
+    'track_token',
+    'post_acq_dt',
+    'pass_id',
+    'n_bursts',
+    'product_found',
+    'matched_opera_id',
+    'time_diff_seconds',
+    'n_bursts_with_baseline',
+    'missing_product_expected',
+    'reason',
+]
+ORPHAN_COLUMNS = ['opera_id', 'mgrs_tile_id', 'acq_time', 'nearest_pass_diff_seconds', 'reason']
+
+
 def _to_utc(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, utc=True)
 
@@ -139,7 +155,7 @@ def check_coverage(
                 detail = 'baseline not checked (no lookback RTC metadata)'
             record['reason'] = f'no DIST-S1 product for RTC pass at {row.post_acq_dt} ({detail})'
         records.append(record)
-    return pd.DataFrame(records)
+    return pd.DataFrame(records, columns=COVERAGE_COLUMNS)
 
 
 def check_orphan_products(
@@ -169,4 +185,4 @@ def check_orphan_products(
                     'reason': 'DIST-S1 product exists but no matching RTC pass found in expected groups',
                 }
             )
-    return pd.DataFrame(records)
+    return pd.DataFrame(records, columns=ORPHAN_COLUMNS)
