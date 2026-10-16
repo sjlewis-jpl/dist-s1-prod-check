@@ -162,6 +162,9 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
     result = cli_runner.invoke(cli, [*args, '--data-dir', str(data_dir), '--out-dir', str(out_dir)])
     assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
     assert attempts == []
+    from dist_s1_prod_check.reconcile import reconcile_run
+
+    assert reconcile_run(run_dir(out_dir)) == [], 'HTML counts, map and CSVs must reconcile (Task 4.6)'
 
     counts = {
         'args': args,

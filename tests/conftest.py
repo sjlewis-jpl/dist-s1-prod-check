@@ -14,3 +14,12 @@ def tmp_data_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def cli_runner() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _reset_offline() -> None:
+    """`--offline` sets a module-level switch; reset it so one CLI test cannot leak it into the next."""
+    from dist_s1_prod_check import network
+
+    yield
+    network.set_offline(False)

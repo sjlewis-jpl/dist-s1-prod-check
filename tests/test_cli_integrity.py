@@ -545,3 +545,25 @@ def test_f20_orphans_section_and_empty_csv_header(tmp_path: Path, tmp_data_dir: 
     assert (orphans['n_universe'], orphans['n_unknown'], orphans['green']) == (3, 0, True)
     (path,) = run_dir(out_dir).glob('coverage_orphans_2*.csv')
     assert path.read_text().splitlines()[0].startswith('opera_id,mgrs_tile_id'), path.read_text()[:80]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Task 4.6: the HTML's section counts, map and CSVs reconcile.
+
+
+@pytest.mark.parametrize('variant', ['clean', 'failures'])
+def test_report_reconciles_with_csvs(variant: str, tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    from dist_s1_prod_check.reconcile import reconcile_run
+
+    dist, rtc, tag_df = _world(n=3, extra_pre=variant == 'failures')
+    if variant == 'failures':
+        tag_df.loc[tag_df.opera_id == dist.opera_id.iloc[2], 'error'] = 'RasterioIOError: 404'
+        dist = make_dist([*({'opera_id': o} for o in dist.opera_id), {'opera_id': dist_id(TILE, _acq(1), _acq(1))}])
+    seed_data_dir(tmp_data_dir, dist, rtc, tag_df, target_tiles=[TILE])
+    out_dir = tmp_path / 'out'
+    result = _run_all(cli_runner, tmp_data_dir, out_dir, '--offline')  # keep the cached tag error
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    _, data = _report(out_dir)
+    if variant == 'failures':
+        assert not all(s['green'] for s in data['sections'])
+    assert reconcile_run(run_dir(out_dir)) == []
