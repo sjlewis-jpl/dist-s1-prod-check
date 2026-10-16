@@ -75,7 +75,6 @@ F07_CASES = {
 
 
 # aa2014f: confirmation compares truncated ids (tile + acquisition), so B is PASS in every case
-@pytest.mark.xfail(strict=True, reason='F07: confirmation compares truncated ids, ignoring version and processing time')
 @pytest.mark.parametrize('case', list(F07_CASES))
 def test_f07_confirmation_compares_full_ids_by_processing_time(
     case: str, tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch

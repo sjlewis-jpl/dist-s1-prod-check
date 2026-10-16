@@ -756,8 +756,11 @@ def _confirmation_section(
     expect_none_at_start: bool,
     wkt_map: dict[str, str],
     state: SectionState = SectionState.COMPLETE,
+    df_versions: pd.DataFrame | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
-    df_conf = checks.check_confirmation(df_dedup, df_tags, expect_none_at_start=expect_none_at_start)
+    df_conf = checks.check_confirmation(
+        df_dedup, df_tags, expect_none_at_start=expect_none_at_start, df_versions=df_versions
+    )
     # The predecessor comes from the full deduplicated table; the universe is the products whose tags were read
     # for this run (all of them, or the --sample-inputs sample), each with exactly one status (F03).
     df_conf = df_conf[df_conf.opera_id.isin(df_tags.opera_id)].reset_index(drop=True)
@@ -768,9 +771,10 @@ def _confirmation_section(
     section = report.build_section(
         'confirmation',
         'Confirmation chain',
-        'Products whose prior_dist_s1_product tag does not point to the previous product in the tile time series. '
-        'The first product of each tile in the window has no predecessor to check and is skipped unless '
-        '--expect-none-at-start is set.',
+        'Products whose prior_dist_s1_product tag is not the latest version of the previous acquisition in the tile '
+        'that existed when the product was processed (full ids, all versions; processing time is the proxy for '
+        'availability). A prior reprocessed only after the product is INFO (stale chain). The first product of each '
+        'tile in the window has no predecessor to check and is skipped unless --expect-none-at-start is set.',
         df_bad,
         int(df_conf.status.isin(EVALUATED).sum()),
         state=state,
@@ -1007,7 +1011,12 @@ def check_ordering(
 @data_dir_option
 @out_dir_option
 def check_confirmation(
-    expect_none_at_start: bool, data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str
+    expect_none_at_start: bool,
+    data_dir: Path,
+    out_dir: Path,
+    regression_baseline: bool,
+    product_versions: str,
+    offline: bool,
 ) -> None:
     """Check the confirmation chain via prior product tags (check 4)."""
     _run_single_check(
@@ -1015,10 +1024,11 @@ def check_confirmation(
         'confirmation',
         'DIST-S1 confirmation chain',
         lambda run: _confirmation_section(
-            df_dedup := checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions)),
+            df_dedup := checks.deduplicate_products(df_all := _load_dist_checked(data_dir, run, product_versions)),
             tags.align_to_products(df_dedup, _load_tags(data_dir)),
             expect_none_at_start,
             _wkt_by_tile(_all_tile_geoms()),
+            df_versions=df_all,
         ),
         regression_baseline,
     )
@@ -1111,7 +1121,13 @@ def _check_coverage_standalone(
 @data_dir_option
 @out_dir_option
 def check_coverage(
-    start: str, stop: str, data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str
+    start: str,
+    stop: str,
+    data_dir: Path,
+    out_dir: Path,
+    regression_baseline: bool,
+    product_versions: str,
+    offline: bool,
 ) -> None:
     """Check all triggerable DIST-S1 products exist given available RTC-S1 inputs (check 6)."""
     _run_single_check(
@@ -1236,6 +1252,7 @@ def run_all(
         df_dist = df_dist[in_window].reset_index(drop=True)
         # Version context comes from every version in the window, before any processing filter (F18).
         df_dist = checks.attach_version_context(df_dist)
+        df_versions = df_dist
         if processing_start or processing_stop:
             n_before = len(df_dist)
             df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
@@ -1298,7 +1315,9 @@ def run_all(
         builds = {
             'duplicates': lambda: _duplicates_section(df_dist, wkt_map, all_state),
             'ordering': lambda: _ordering_section(df_dedup, wkt_map, all_state),
-            'confirmation': lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map, tag_state),
+            'confirmation': lambda: _confirmation_section(
+                df_dedup, df_tags, expect_none_at_start, wkt_map, tag_state, df_versions=df_versions
+            ),
             'inputs': lambda: _inputs_section(
                 df_tags,
                 df_frame,

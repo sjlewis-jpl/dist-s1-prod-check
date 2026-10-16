@@ -17,7 +17,7 @@
     ],
     "csv_rows": {
       "confirmation": 618,
-      "confirmation_failures": 2,
+      "confirmation_failures": 3,
       "confirmation_tiles": 19,
       "coverage": 747,
       "coverage_missing": 42,
@@ -34,7 +34,7 @@
     "sections": {
       "confirmation": {
         "n_checked": 599,
-        "n_failures": 2
+        "n_failures": 3
       },
       "coverage": {
         "n_checked": 671,
@@ -124,7 +124,7 @@
         "n_failures": 41
       },
       "ordering": {
-        "n_checked": 561,
+        "n_checked": 251,
         "n_failures": 0
       }
     }

@@ -1,7 +1,5 @@
-import numpy as np
 import pandas as pd
 
-from dist_s1_prod_check.ids import get_opera_id_trunc
 from dist_s1_prod_check.status import Status
 
 
@@ -137,48 +135,94 @@ def summarize_by_tile(df_products: pd.DataFrame, fail_col: str) -> pd.DataFrame:
     return df_products.groupby('mgrs_tile_id').apply(_one, include_groups=False).reset_index()
 
 
+def _version_index(df_versions: pd.DataFrame) -> tuple[dict, dict, dict]:
+    """Index every version: previous acquisition per acquisition, versions per acquisition, time per version."""
+    df = df_versions.sort_values(['mgrs_tile_id', 'acq_time', 'processing_time', 'opera_id'], kind='stable')
+    acqs = df.drop_duplicates(subset='opera_dedup_id')
+    prev = acqs.groupby('mgrs_tile_id')['opera_dedup_id'].shift(1)
+    prev_acq = {k: v for k, v in zip(acqs.opera_dedup_id, prev) if isinstance(v, str)}
+    versions = {k: list(g.opera_id) for k, g in df.groupby('opera_dedup_id', sort=False)}
+    proc = dict(zip(df.opera_id, df.processing_time))
+    return prev_acq, versions, proc
+
+
+def _confirm_one(b_id: str, b_proc: pd.Timestamp, prior: str, prev: str, versions: dict, proc: dict) -> tuple:
+    """Status, reason and ideal prior for a product `b_id` whose previous acquisition is `prev` (decision 3)."""
+    candidates = versions[prev]
+    existing = [v for v in candidates if proc[v] <= b_proc]
+    ideal = existing[-1] if existing else 'None'
+    if prior == 'None':
+        return Status.FAIL, f'no prior, but acquisition {prev} precedes the product', ideal
+    if prior not in candidates:
+        return Status.FAIL, f'prior {prior} is not a version of the previous acquisition {prev}', ideal
+    if proc[prior] > b_proc:
+        return Status.FAIL, f'prior processed after product: {prior} at {proc[prior]}, product at {b_proc}', ideal
+    newer = [v for v in candidates if proc[v] > proc[prior]]
+    outdated = [v for v in newer if proc[v] <= b_proc]
+    if outdated:
+        return Status.FAIL, f'outdated prior: newer version {outdated[-1]} was processed before the product', ideal
+    if newer:
+        return Status.INFO, f'stale chain: {newer[-1]} was reprocessed after the product', ideal
+    return Status.PASS, '', ideal
+
+
 def check_confirmation(
     df_dist_dedup: pd.DataFrame,
     df_tags: pd.DataFrame,
     expect_none_at_start: bool = False,
+    df_versions: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Check each product's `prior_dist_s1_product` tag points to the previous product in its tile's time series.
+    """Check each product's `prior_dist_s1_product` tag against the previous acquisition in its tile (F07).
 
-    Returns one row per product of `df_dist_dedup` with a `status`: UNKNOWN when its tag could not be read (no tag
-    row, no tag URL, read error), SKIPPED for the first product of a tile in the window unless
-    `expect_none_at_start`, else PASS or FAIL. `confirmed_ok` is False for both FAIL and UNKNOWN.
+    The prior must be the latest version of the previous acquisition that existed when the product was processed,
+    compared by **full** id against every version in `df_versions` (default `df_dist_dedup`; pass the
+    version-filtered table before any processing filter). Processing time is the proxy for availability: a version
+    existed for a product if it was processed at or before the product. For product B and previous acquisition A:
+
+    - FAIL if the prior is not one of A's versions (or is 'None'), or was processed after B;
+    - FAIL if a newer version of A was processed before B (outdated prior);
+    - INFO ``stale chain`` if a newer version of A was processed only after B;
+    - otherwise PASS.
+
+    One row per product of `df_dist_dedup`. UNKNOWN when its tag could not be read; the first acquisition of a tile
+    in the window is SKIPPED unless `expect_none_at_start` (then its prior must be 'None'). `confirmed_ok` is False
+    for FAIL and UNKNOWN. `prior_expected` is the ideal prior (A's latest version existing at B's processing time).
     """
+    df_versions = df_dist_dedup if df_versions is None else df_versions
+    prev_acq, versions, proc = _version_index(pd.concat([df_versions, df_dist_dedup]).drop_duplicates('opera_id'))
     df = df_dist_dedup.merge(df_tags[['opera_id', 'prior_dist_s1_product', 'error']], on='opera_id', how='left')
     df = df.sort_values(['mgrs_tile_id', 'acq_time'])
 
     df['tag_missing'] = df.error.isna() | (df.error != '') | df.prior_dist_s1_product.isna()
     df['tile_incomplete'] = df.groupby('mgrs_tile_id')['tag_missing'].transform('any')
     df['prior_used'] = df.prior_dist_s1_product.fillna('').map(lambda p: p.split('/')[-1] or 'None')
-    df['prior_expected'] = df.groupby('mgrs_tile_id')['opera_id'].shift(1).fillna('None')
-    df['is_first_in_window'] = df.prior_expected == 'None'
+    df['is_first_in_window'] = ~df.opera_dedup_id.isin(prev_acq.keys())
 
-    used = df.prior_used.map(get_opera_id_trunc)
-    expected = df.prior_expected.map(get_opera_id_trunc)
-    df['confirmed_ok'] = used == expected
-    if not expect_none_at_start:
-        df.loc[df.is_first_in_window, 'confirmed_ok'] = True
-    df.loc[df.tag_missing, 'confirmed_ok'] = False
-
-    df['status'] = np.select(
-        [df.tag_missing, df.is_first_in_window & (not expect_none_at_start), df.confirmed_ok],
-        [Status.UNKNOWN, Status.SKIPPED, Status.PASS],
-        Status.FAIL,
-    )
-
-    def _reason(row: pd.Series) -> str:
+    statuses, reasons, ideals = [], [], []
+    for row in df.itertuples():
+        prev = prev_acq.get(row.opera_dedup_id)
         if row.tag_missing:
             detail = row.error if isinstance(row.error, str) and row.error else 'no tag row'
-            return f'could not read prior_dist_s1_product tag ({detail})'
-        if not row.confirmed_ok:
-            return f'prior product used: {row.prior_used}; expected: {row.prior_expected}'
-        return ''
-
-    df['reason'] = df.apply(_reason, axis=1)
+            status, reason, ideal = Status.UNKNOWN, f'could not read prior_dist_s1_product tag ({detail})', 'None'
+        elif prev is None:
+            ideal = 'None'
+            if not expect_none_at_start:
+                status, reason = Status.SKIPPED, 'first acquisition of the tile in the window'
+            elif row.prior_used == 'None':
+                status, reason = Status.PASS, ''
+            else:
+                status, reason = Status.FAIL, f'prior {row.prior_used} given, but the window starts the mission'
+        else:
+            status, reason, ideal = _confirm_one(
+                row.opera_id, row.processing_time, row.prior_used, prev, versions, proc
+            )
+        statuses.append(status)
+        reasons.append(reason)
+        ideals.append(ideal)
+    df['prior_expected'] = ideals
+    df['status'] = pd.Series(statuses, index=df.index, dtype=str)
+    df['reason'] = reasons
+    df['confirmed_ok'] = ~df.status.isin([Status.FAIL, Status.UNKNOWN])
 
     cols = [
         'opera_id',
