@@ -7,6 +7,7 @@ import pytest
 from dist_s1_prod_check import inputs
 from dist_s1_prod_check.cmr import build_rtc_input_frame
 from dist_s1_prod_check.constants import DELTA_LOOKBACK_DAYS
+from dist_s1_prod_check.ids import get_opera_id_trunc
 from factories import bursts_for_tile, dist_id, make_rtc, make_tags
 
 
@@ -143,3 +144,42 @@ def test_f22_enumeration_error_stays_per_tile(monkeypatch: pytest.MonkeyPatch) -
     df = inputs.check_inputs_offline(df_tags, frame)
 
     assert df.issue_type.tolist() == ['Enumeration error'] * 2 and set(df.status) == {'UNKNOWN'}
+
+
+def _reprocessed(opera_id: str) -> str:
+    """Return the same RTC acquisition (truncated id) with another processing time."""
+    tokens = opera_id.split('_')
+    tokens[5] = '20991231T000000Z'
+    return '_'.join(tokens)
+
+
+# F26: inputs are compared as multisets, so a repeated input id is reported as found but not expected.
+def test_f26_duplicate_rtc_input_fails() -> None:
+    frame = _rtc_frame()
+    tags_b = _expected_inputs(frame, T_B)
+    dup = tags_b['post_rtc_opera_ids'][0]
+    id_b = dist_id(TILE, T_B, PROC)
+    df_tags = make_tags([{'opera_id': id_b, **tags_b, 'post_rtc_opera_ids': [*tags_b['post_rtc_opera_ids'], dup]}])
+
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    rows = df[df.issue_type == 'Post RTC IDs found but not expected']
+    assert len(rows) == 1 and rows.issue_value.iloc[0] == get_opera_id_trunc(dup), df.to_dict('records')
+    assert set(df.status) == {'FAIL'}
+
+
+# F26: an input reprocessed since the archive snapshot is an INFO note; it does not fail the product.
+def test_f26_rtc_processing_version_difference_is_info() -> None:
+    frame = _rtc_frame()
+    tags_b = _expected_inputs(frame, T_B)
+    archived = tags_b['pre_rtc_opera_ids'][0]
+    newer = _reprocessed(archived)
+    id_b = dist_id(TILE, T_B, PROC)
+    df_tags = make_tags([{'opera_id': id_b, **tags_b, 'pre_rtc_opera_ids': [newer, *tags_b['pre_rtc_opera_ids'][1:]]}])
+
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    assert df.status.tolist() == ['PASS', 'INFO'] and df.inputs_correct.tolist() == [True, True]
+    note = df.iloc[1]
+    assert note.issue_type == 'RTC processing version differs'
+    assert newer in note.issue_value and archived in note.issue_value

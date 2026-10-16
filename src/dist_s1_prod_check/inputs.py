@@ -1,5 +1,6 @@
 import hashlib
 import json
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -150,11 +151,35 @@ def compare_inputs(
         ('Post RTC IDs found but not expected', df_post, exp_post),
     ]
     for issue_type, df_left, df_right in comparisons:
-        diff = sorted(set(df_left.opera_id_trunc) - set(df_right.opera_id_trunc))
+        # Multisets (F26): an input id listed twice but expected once appears once in "found but not expected".
+        diff = sorted((Counter(df_left.opera_id_trunc) - Counter(df_right.opera_id_trunc)).elements())
         if diff:
             issues.append(_issue(issue_type, ';'.join(diff)))
 
     return issues
+
+
+def archive_ids_by_trunc(opera_ids: pd.Series) -> dict[str, list[str]]:
+    """Full RTC-S1 ids of an archive table (frame or enumerator output) keyed by truncated id."""
+    ids = pd.Series(opera_ids).drop_duplicates()
+    return {trunc: sorted(group) for trunc, group in ids.groupby(ids.map(get_opera_id_trunc))}
+
+
+def _version_notes(df_actual: pd.DataFrame, archive_by_trunc: dict[str, list[str]] | None) -> list[dict]:
+    """INFO `RTC processing version differs` for inputs whose acquisition is archived under another full id (F26).
+
+    The tags name an RTC-S1 product whose truncated id (burst and acquisition) is in the archive table but whose
+    full id (processing time, version) is not, e.g. because the input was reprocessed after the product was made.
+    Pass/fail depends only on acquisition identity, so this is a note, not a failure.
+    """
+    if not archive_by_trunc:
+        return []
+    differs = [
+        f'{r.opera_id} vs archive {",".join(archive_by_trunc[r.opera_id_trunc])}'
+        for r in df_actual.drop_duplicates('opera_id').itertuples()
+        if r.opera_id_trunc in archive_by_trunc and r.opera_id not in archive_by_trunc[r.opera_id_trunc]
+    ]
+    return [_issue('RTC processing version differs', ';'.join(differs), status='INFO')] if differs else []
 
 
 def _expected_product_index(df_expected: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -211,7 +236,10 @@ def _identity_issues(tag_tile: str, tile: str, acq: pd.Timestamp, df_actual: pd.
 
 
 def _check_products_against_expected(
-    df_tags_tile: pd.DataFrame, df_expected: pd.DataFrame, pol_by_opera_id: dict[str, str] | None = None
+    df_tags_tile: pd.DataFrame,
+    df_expected: pd.DataFrame,
+    pol_by_opera_id: dict[str, str] | None = None,
+    archive_by_trunc: dict[str, list[str]] | None = None,
 ) -> list[dict]:
     """Check one tile's products against the tile's expected products and return their result records.
 
@@ -221,7 +249,8 @@ def _check_products_against_expected(
     without an input comparison.
 
     A product whose tags cannot be parsed or compared gets one UNKNOWN `Comparison error` row and takes no part in
-    claiming, so its tile neighbours are still checked (F22). Errors enumerating the tile are the caller's
+    claiming, so its tile neighbours are still checked (F22). Inputs archived under another full id in
+    `archive_by_trunc` add an INFO note (`_version_notes`). Errors enumerating the tile are the caller's
     (`_check_one_tile`: the whole tile is UNKNOWN `Enumeration error`).
     """
     index_by_tile = _expected_product_index(df_expected)
@@ -236,7 +265,10 @@ def _check_products_against_expected(
         try:
             acq = get_acq_timestamp(row.opera_id)
             df_actual = parse_actual_inputs(row.pre_rtc_opera_ids, row.post_rtc_opera_ids)
-            issues = _identity_issues(row.mgrs_tile_id, tile, acq, df_actual)
+            issues = [
+                *_identity_issues(row.mgrs_tile_id, tile, acq, df_actual),
+                *_version_notes(df_actual, archive_by_trunc),
+            ]
             post_tracks = sorted(df_actual[df_actual.input_category == 'post'].track_number.unique().tolist())
             match = _match_expected_product(index_by_tile.get(tile), acq, post_tracks)
         except Exception as e:
@@ -277,7 +309,12 @@ def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.Ge
         df_expected = pd.DataFrame(df_expected.drop(columns='geometry'))
         df_expected['opera_id_trunc'] = df_expected.opera_id.map(get_opera_id_trunc)
         pol_by_opera_id = dict(zip(df_tile_frame.opera_id.map(get_opera_id_trunc), df_tile_frame.polarizations))
-        return _check_products_against_expected(df_tags_tile, df_expected, pol_by_opera_id=pol_by_opera_id)
+        return _check_products_against_expected(
+            df_tags_tile,
+            df_expected,
+            pol_by_opera_id=pol_by_opera_id,
+            archive_by_trunc=archive_ids_by_trunc(df_tile_frame.opera_id),
+        )
     except Exception as e:
         return [
             _record({'opera_id': row.opera_id, 'mgrs_tile_id': tile}, 'UNKNOWN', 'Enumeration error', _error_text(e))
@@ -497,7 +534,10 @@ def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataF
             track_number = int(df_actual.track_number.iloc[0])
             df_expected = _enumerate_one(row.mgrs_tile_id, track_number, str(df_post.acq_dt.min().date()))
             pol_by_opera_id = dict(zip(df_expected.opera_id_trunc, df_expected.polarizations))
-            issues = compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id)
+            issues = [
+                *compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id),
+                *_version_notes(df_actual, archive_ids_by_trunc(df_expected.opera_id)),
+            ]
         except Exception as e:
             return [_record(base, 'UNKNOWN', 'Enumeration error', _error_text(e))]
         return _product_records(base, issues)
