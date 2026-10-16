@@ -1,4 +1,5 @@
 import json
+from html import escape
 from pathlib import Path
 
 import geopandas as gpd
@@ -70,17 +71,40 @@ def _tile_features(section: dict, tile_geoms: gpd.GeoDataFrame) -> list[dict]:
     return features
 
 
+def _banner_html(run_status: dict) -> str:
+    """Return the banner for a run that did not complete, rendered server-side so it shows without JavaScript."""
+    if run_status['state'] == 'COMPLETE':
+        return ''
+    failed = run_status.get('failed_check')
+    what = (
+        f'<code>{escape(failed)}</code> raised {escape(str(run_status.get("error")))}'
+        if failed
+        else 'run did not finish'
+    )
+    not_run = ', '.join(run_status.get('not_run') or []) or 'none'
+    return (
+        f'<div class="banner" id="banner"><b>INCOMPLETE:</b> {what}; not run: {escape(not_run)}. '
+        'Results below are partial and must not be read as a pass.</div>'
+    )
+
+
 def write_html_report(
     sections: list[dict],
     tile_geoms: gpd.GeoDataFrame,
     out_path: str | Path,
     title: str = 'DIST-S1 Production Check',
     subtitle: str = '',
+    run_status: dict | None = None,
 ) -> Path:
-    """Write a self-contained HTML report: map of failing MGRS tiles, stat tiles, and per-check tables with CSV export."""
+    """Write a self-contained HTML report: map of failing MGRS tiles, stat tiles, and per-check tables with CSV export.
+
+    `run_status` is ``{'state', 'failed_check', 'error', 'not_run'}``. Unless its state is COMPLETE the page opens
+    with an INCOMPLETE banner, and the failed and never-run checks are drawn as grey tiles (they are not sections).
+    """
     payload = {
         'title': title,
         'subtitle': subtitle,
+        'run_status': run_status or {'state': 'COMPLETE', 'failed_check': None, 'error': None, 'not_run': []},
         'sections': [
             {
                 **section,
@@ -92,7 +116,11 @@ def write_html_report(
         ],
     }
     data_js = json.dumps(payload, default=str).replace('</', '<\\/')
-    html = _TEMPLATE.replace('__TITLE__', title).replace('__DATA__', data_js)
+    html = (
+        _TEMPLATE.replace('__TITLE__', title)
+        .replace('__BANNER__', _banner_html(payload['run_status']))
+        .replace('__DATA__', data_js)
+    )
     out_path = Path(out_path)
     out_path.write_text(html)
     return out_path
@@ -162,6 +190,9 @@ _TEMPLATE = r"""<!doctype html>
   .summary-tbl td { cursor: pointer; }
   .summary-tbl tbody tr:hover td { background: var(--page); }
   td a { color: inherit; text-decoration: underline; text-decoration-color: var(--muted); }
+  .banner { background: var(--critical); color: #fff; border-radius: 10px; padding: 12px 16px; margin-top: 14px;
+            font-size: 0.95rem; }
+  .tile.grey { opacity: 0.75; } .tile .value.na { color: var(--muted); }
   .empty { color: var(--good); font-size: 0.9rem; padding: 8px 0; }
   .leaflet-popup-content { font: 0.78rem system-ui, sans-serif; max-height: 260px; overflow-y: auto; }
   .leaflet-popup-content b { font-size: 0.85rem; }
@@ -172,6 +203,7 @@ _TEMPLATE = r"""<!doctype html>
 <div class="wrap">
   <h1 id="title"></h1>
   <div class="subtitle" id="subtitle"></div>
+  __BANNER__
   <div class="tiles" id="tiles"></div>
   <div id="map"></div>
   <div id="sections"></div>
@@ -182,6 +214,8 @@ const dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark
 
 document.getElementById('title').textContent = DATA.title;
 document.getElementById('subtitle').textContent = DATA.subtitle;
+
+const RS = DATA.run_status;
 
 const map = L.map('map', {worldCopyJump: true}).setView([15, 0], 2);
 L.tileLayer(
@@ -236,6 +270,17 @@ DATA.sections.forEach(sec => {
       <div class="label"><span class="swatch" style="background:${color}"></span>${esc(sec.title)}</div>
       <div class="value ${cls}">${sec.n_failures.toLocaleString()}</div>
       <div class="sub">flagged of ${sec.n_checked.toLocaleString()} checked</div>
+    </div>`);
+});
+
+const greyTiles = (RS.failed_check && !DATA.sections.some(s => s.key === RS.failed_check) ? [[RS.failed_check, 'ERROR']] : [])
+  .concat(RS.not_run.map(k => [k, 'NOT_RUN']));
+greyTiles.forEach(([key, state]) => {
+  tilesDiv.insertAdjacentHTML('beforeend', `
+    <div class="tile grey">
+      <div class="label">${esc(key)}</div>
+      <div class="value na">${state === 'ERROR' ? 'error' : 'not run'}</div>
+      <div class="sub">${state}</div>
     </div>`);
 });
 

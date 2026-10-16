@@ -1,11 +1,12 @@
 import shutil
+from collections.abc import Callable
 from pathlib import Path
 
 import click
 import geopandas as gpd
 import pandas as pd
 
-from dist_s1_prod_check import checks, coverage, inputs, report, tags
+from dist_s1_prod_check import checks, coverage, inputs, report, status, tags
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
     INPUTS_CHECKPOINT_PARQUET,
@@ -85,25 +86,110 @@ def _write_csvs(out_dir: Path, stamp: str, csvs: dict[str, pd.DataFrame]) -> Non
 
 
 def _write_report(
-    out_dir: Path, stamp: str, tile_geoms: gpd.GeoDataFrame, sections: list[dict], title: str, subtitle: str
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    html_path = report.write_html_report(sections, tile_geoms, out_dir / f'report_{stamp}.html', title, subtitle)
-    click.echo(f'Wrote {html_path}')
-
-
-def _write_outputs(
     out_dir: Path,
     stamp: str,
     tile_geoms: gpd.GeoDataFrame,
     sections: list[dict],
-    csvs: dict[str, pd.DataFrame],
     title: str,
     subtitle: str,
+    run_status: dict | None = None,
 ) -> None:
-    _write_csvs(out_dir, stamp, csvs)
-    _write_report(out_dir, stamp, tile_geoms, sections, title, subtitle)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    html_path = report.write_html_report(
+        sections, tile_geoms, out_dir / f'report_{stamp}.html', title, subtitle, run_status=run_status
+    )
+    click.echo(f'Wrote {html_path}')
 
+
+class _Run:
+    """Track one command's run: `run_status.json`, CSVs and the HTML report, complete or partial.
+
+    Writes RUNNING on creation. Inside ``with run:`` each check is wrapped by `stage` and recorded by `add`;
+    `complete` writes the report and then COMPLETE as the very last step. Any exception leaving the block writes
+    INCOMPLETE, then a partial report with an INCOMPLETE banner, and propagates unchanged; an error while writing the
+    partial report is logged and never replaces the original exception.
+    """
+
+    def __init__(self, out_dir: Path, stamp: str, checks: list[str], title: str) -> None:
+        self.out_dir, self.stamp, self.checks, self.title = out_dir, stamp, checks, title
+        self.subtitle = ''
+        self.current = 'setup'
+        self.done: list[str] = []
+        self.sections: list[dict] = []
+        status.write_run_status(out_dir, status.RunState.RUNNING, checks_planned=checks, checks_done=[])
+
+    def __enter__(self) -> '_Run':
+        return self
+
+    def stage(self, name: str) -> None:
+        self.current = name
+
+    def add(self, key: str, sections: list[dict], csvs: dict[str, pd.DataFrame]) -> None:
+        for section in sections:
+            click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
+        self.sections.extend(sections)
+        _write_csvs(self.out_dir, self.stamp, csvs)
+        self.done.append(key)
+
+    def _status_dict(self, state: status.RunState, error: str | None = None) -> dict:
+        failed = self.current if state != status.RunState.COMPLETE else None
+        not_run = [c for c in self.checks if c not in self.done and c != failed]
+        return {'state': str(state), 'failed_check': failed, 'error': error, 'not_run': not_run}
+
+    def complete(self) -> None:
+        self.current = 'report'
+        _write_report(
+            self.out_dir,
+            self.stamp,
+            _all_tile_geoms(),
+            self.sections,
+            self.title,
+            self.subtitle,
+            run_status=self._status_dict(status.RunState.COMPLETE),
+        )
+        status.write_run_status(
+            self.out_dir, status.RunState.COMPLETE, checks_planned=self.checks, checks_done=self.done
+        )
+
+    def __exit__(self, exc_type: type | None, exc: BaseException | None, tb: object) -> bool:
+        if exc is None:
+            return False
+        error = f'{exc_type.__name__}: {exc}'
+        status.write_run_status(
+            self.out_dir,
+            status.RunState.INCOMPLETE,
+            checks_planned=self.checks,
+            checks_done=self.done,
+            failed_check=self.current,
+            error=error,
+        )
+        try:
+            _write_report(
+                self.out_dir,
+                self.stamp,
+                _all_tile_geoms(),
+                self.sections,
+                self.title,
+                self.subtitle,
+                run_status=self._status_dict(status.RunState.INCOMPLETE, error),
+            )
+        except Exception as report_exc:  # noqa: BLE001
+            click.echo(f'Could not write the partial report: {type(report_exc).__name__}: {report_exc}', err=True)
+        return False
+
+
+def _run_single_check(
+    out_dir: Path, key: str, title: str, build: Callable[[], tuple[list[dict], dict[str, pd.DataFrame]]]
+) -> None:
+    """Run one standalone `check-*` command under a tracked run."""
+    with _Run(out_dir, _stamp(), [key], title) as run:
+        run.stage(key)
+        sections, csvs = build()
+        run.add(key, sections, csvs)
+        run.complete()
+
+
+RUN_ALL_CHECKS = ('duplicates', 'ordering', 'confirmation', 'inputs', 'coverage')
 
 data_dir_option = click.option('--data-dir', type=click.Path(path_type=Path), default=Path('data'), show_default=True)
 out_dir_option = click.option('--out-dir', type=click.Path(path_type=Path), default=Path('outputs'), show_default=True)
@@ -429,9 +515,12 @@ def _coverage_section(
 @out_dir_option
 def check_duplicates(data_dir: Path, out_dir: Path) -> None:
     """Check for duplicated DIST-S1 products (check 2)."""
-    df_dist = _load_dist(data_dir)
-    sections, csvs = _duplicates_section(df_dist, _wkt_by_tile(_all_tile_geoms()))
-    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 duplicates', '')
+    _run_single_check(
+        out_dir,
+        'duplicates',
+        'DIST-S1 duplicates',
+        lambda: _duplicates_section(_load_dist(data_dir), _wkt_by_tile(_all_tile_geoms())),
+    )
 
 
 @cli.command()
@@ -439,10 +528,12 @@ def check_duplicates(data_dir: Path, out_dir: Path) -> None:
 @out_dir_option
 def check_ordering(data_dir: Path, out_dir: Path) -> None:
     """Check processing order matches acquisition order (check 3)."""
-    df_dist = _load_dist(data_dir)
-    df_dedup = checks.deduplicate_products(df_dist)
-    sections, csvs = _ordering_section(df_dedup, _wkt_by_tile(_all_tile_geoms()))
-    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 processing order', '')
+    _run_single_check(
+        out_dir,
+        'ordering',
+        'DIST-S1 processing order',
+        lambda: _ordering_section(checks.deduplicate_products(_load_dist(data_dir)), _wkt_by_tile(_all_tile_geoms())),
+    )
 
 
 @cli.command()
@@ -453,12 +544,17 @@ def check_ordering(data_dir: Path, out_dir: Path) -> None:
 @out_dir_option
 def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path) -> None:
     """Check the confirmation chain via prior product tags (check 4)."""
-    df_dist = _load_dist(data_dir)
-    df_dedup = checks.deduplicate_products(df_dist)
-    sections, csvs = _confirmation_section(
-        df_dedup, _load_tags(data_dir), expect_none_at_start, _wkt_by_tile(_all_tile_geoms())
+    _run_single_check(
+        out_dir,
+        'confirmation',
+        'DIST-S1 confirmation chain',
+        lambda: _confirmation_section(
+            checks.deduplicate_products(_load_dist(data_dir)),
+            _load_tags(data_dir),
+            expect_none_at_start,
+            _wkt_by_tile(_all_tile_geoms()),
+        ),
     )
-    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 confirmation chain', '')
 
 
 @cli.command()
@@ -470,21 +566,24 @@ def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path
 @out_dir_option
 def check_inputs(mode: str, sample: int, seed: int, workers: int, data_dir: Path, out_dir: Path) -> None:
     """Check product inputs against re-enumerated expected inputs (check 5)."""
-    df_dist = _load_dist(data_dir)
-    df_tags = _load_tags(data_dir)
-    df_tags = df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)]
-    if sample:
-        df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
-    df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir) if mode == 'offline' else None
-    sections, csvs = _inputs_section(
-        df_tags,
-        df_frame,
-        mode,
-        workers,
-        _wkt_by_tile(_all_tile_geoms()),
-        checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
-    )
-    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 product inputs', '')
+
+    def build() -> tuple[list[dict], dict[str, pd.DataFrame]]:
+        df_dist = _load_dist(data_dir)
+        df_tags = _load_tags(data_dir)
+        df_tags = df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)]
+        if sample:
+            df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
+        df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir) if mode == 'offline' else None
+        return _inputs_section(
+            df_tags,
+            df_frame,
+            mode,
+            workers,
+            _wkt_by_tile(_all_tile_geoms()),
+            checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
+        )
+
+    _run_single_check(out_dir, 'inputs', 'DIST-S1 product inputs', build)
 
 
 @cli.command()
@@ -494,11 +593,18 @@ def check_inputs(mode: str, sample: int, seed: int, workers: int, data_dir: Path
 @out_dir_option
 def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None:
     """Check all triggerable DIST-S1 products exist given available RTC-S1 inputs (check 6)."""
-    df_dist = _load_dist(data_dir)
-    df_dedup = checks.deduplicate_products(df_dist)
-    df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir)
-    sections, csvs = _coverage_section(df_dedup, df_frame, start, stop, _wkt_by_tile(_all_tile_geoms()))
-    _write_outputs(out_dir, _stamp(), _all_tile_geoms(), sections, csvs, 'DIST-S1 coverage', '')
+    _run_single_check(
+        out_dir,
+        'coverage',
+        'DIST-S1 coverage',
+        lambda: _coverage_section(
+            checks.deduplicate_products(_load_dist(data_dir)),
+            _build_rtc_frame(_load_rtc(data_dir), data_dir),
+            start,
+            stop,
+            _wkt_by_tile(_all_tile_geoms()),
+        ),
+    )
 
 
 @cli.command()
@@ -559,71 +665,70 @@ def run_all(
     """Run checks 1-6 end to end: download metadata, fetch tags, run every check, write CSVs and an HTML report."""
     from dist_s1_prod_check import cmr
 
-    stamp = _stamp()
-    _check_venue(data_dir, venue)
-    bbox = tuple(bbox) if bbox else None
+    with _Run(out_dir, _stamp(), list(RUN_ALL_CHECKS), 'DIST-S1 Production Check') as run:
+        _check_venue(data_dir, venue)
+        bbox = tuple(bbox) if bbox else None
 
-    need_dist = refresh or not (data_dir / DIST_S1_PARQUET).exists()
-    need_rtc = refresh or not (data_dir / RTC_S1_PARQUET).exists()
-    if need_dist or need_rtc:
-        (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
-        dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
-        chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
-        if refresh:
-            shutil.rmtree(chunks_dir, ignore_errors=True)
-        if need_dist:
-            df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
-            df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
-        if need_rtc:
-            df_rtc = cmr.get_rtc_s1_table_with_lookback(
-                start, stop, bbox=rtc_bbox, max_workers=cmr_workers, cache_dir=chunks_dir
-            )
-            _write_rtc(df_rtc, data_dir, chunks_dir)
-            del df_rtc
-    df_dist = _load_dist(data_dir)
-    if processing_start or processing_stop:
-        df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
-    if sample_tiles:
-        all_tiles = pd.Series(sorted(df_dist.mgrs_tile_id.unique()))
-        keep = set(all_tiles.sample(n=min(sample_tiles, len(all_tiles)), random_state=seed))
-        df_dist = df_dist[df_dist.mgrs_tile_id.isin(keep)].reset_index(drop=True)
-        click.echo(f'Sampled {len(keep)} of {len(all_tiles)} tiles')
-    click.echo(f'DIST-S1 products: {len(df_dist)}')
-    df_rtc = _load_rtc(data_dir)
-    click.echo(f'RTC-S1 granules: {len(df_rtc)}')
-    from dist_s1_prod_check.cmr import build_rtc_input_frame
+        need_dist = refresh or not (data_dir / DIST_S1_PARQUET).exists()
+        need_rtc = refresh or not (data_dir / RTC_S1_PARQUET).exists()
+        if need_dist or need_rtc:
+            (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
+            dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
+            chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
+            if refresh:
+                shutil.rmtree(chunks_dir, ignore_errors=True)
+            if need_dist:
+                df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
+                df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+            if need_rtc:
+                df_rtc = cmr.get_rtc_s1_table_with_lookback(
+                    start, stop, bbox=rtc_bbox, max_workers=cmr_workers, cache_dir=chunks_dir
+                )
+                _write_rtc(df_rtc, data_dir, chunks_dir)
+                del df_rtc
+        df_dist = _load_dist(data_dir)
+        if processing_start or processing_stop:
+            df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
+        if sample_tiles:
+            all_tiles = pd.Series(sorted(df_dist.mgrs_tile_id.unique()))
+            keep = set(all_tiles.sample(n=min(sample_tiles, len(all_tiles)), random_state=seed))
+            df_dist = df_dist[df_dist.mgrs_tile_id.isin(keep)].reset_index(drop=True)
+            click.echo(f'Sampled {len(keep)} of {len(all_tiles)} tiles')
+        click.echo(f'DIST-S1 products: {len(df_dist)}')
+        df_rtc = _load_rtc(data_dir)
+        click.echo(f'RTC-S1 granules: {len(df_rtc)}')
+        from dist_s1_prod_check.cmr import build_rtc_input_frame
 
-    frame_tiles = sorted(keep) if sample_tiles else _load_target_tiles(data_dir)
-    df_frame = build_rtc_input_frame(df_rtc, mgrs_tile_ids=frame_tiles)
+        frame_tiles = sorted(keep) if sample_tiles else _load_target_tiles(data_dir)
+        df_frame = build_rtc_input_frame(df_rtc, mgrs_tile_ids=frame_tiles)
 
-    df_dedup = checks.deduplicate_products(df_dist)
-    df_tags_products = (
-        df_dedup if not sample_inputs else df_dedup.sample(n=min(sample_inputs, len(df_dedup)), random_state=42)
-    )
-    df_tags = tags.fetch_tags_table(
-        df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
-    )
-    df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
-
-    wkt_map = _wkt_by_tile(_all_tile_geoms())
-    subtitle = (
-        f'{start} to {stop}'
-        + (f' over {bbox}' if bbox else ' (global)')
-        + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
-        + (f' - {venue} venue' if venue != 'PROD' else '')
-        + (
-            f' - processed {processing_start or "start"} to {processing_stop or "now"}'
-            if processing_start or processing_stop
-            else ''
+        df_dedup = checks.deduplicate_products(df_dist)
+        df_tags_products = (
+            df_dedup if not sample_inputs else df_dedup.sample(n=min(sample_inputs, len(df_dedup)), random_state=42)
         )
-    )
-    sections = []
-    try:
-        for build in (
-            lambda: _duplicates_section(df_dist, wkt_map),
-            lambda: _ordering_section(df_dedup, wkt_map),
-            lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map),
-            lambda: _inputs_section(
+        run.subtitle = (
+            f'{start} to {stop}'
+            + (f' over {bbox}' if bbox else ' (global)')
+            + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
+            + (f' - {venue} venue' if venue != 'PROD' else '')
+            + (
+                f' - processed {processing_start or "start"} to {processing_stop or "now"}'
+                if processing_start or processing_stop
+                else ''
+            )
+        )
+        run.stage('tags')
+        df_tags = tags.fetch_tags_table(
+            df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
+        )
+        df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
+
+        wkt_map = _wkt_by_tile(_all_tile_geoms())
+        builds = {
+            'duplicates': lambda: _duplicates_section(df_dist, wkt_map),
+            'ordering': lambda: _ordering_section(df_dedup, wkt_map),
+            'confirmation': lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map),
+            'inputs': lambda: _inputs_section(
                 df_tags,
                 df_frame,
                 'offline',
@@ -631,13 +736,9 @@ def run_all(
                 wkt_map,
                 checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
             ),
-            lambda: _coverage_section(df_dedup, df_frame, start, stop, wkt_map),
-        ):
-            built_sections, section_csvs = build()
-            for section in built_sections:
-                click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
-            sections.extend(built_sections)
-            _write_csvs(out_dir, stamp, section_csvs)
-    finally:
-        if sections:
-            _write_report(out_dir, stamp, _all_tile_geoms(), sections, 'DIST-S1 Production Check', subtitle)
+            'coverage': lambda: _coverage_section(df_dedup, df_frame, start, stop, wkt_map),
+        }
+        for key in RUN_ALL_CHECKS:
+            run.stage(key)
+            run.add(key, *builds[key]())
+        run.complete()

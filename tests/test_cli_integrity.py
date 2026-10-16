@@ -241,7 +241,6 @@ def test_f04_checkpoint_tag_error_retried(tmp_path: Path, tmp_data_dir: Path, cl
 
 
 # aa2014f: exit 1 (RuntimeError) but the report has 4 sections, no INCOMPLETE banner and no run_status.json.
-@pytest.mark.xfail(strict=True, reason='F09: crashed run leaves a partial report without an INCOMPLETE marker')
 def test_f09_crash_marks_run_incomplete(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -267,8 +266,20 @@ def test_f09_crash_marks_run_incomplete(
     assert status['failed_check'] == 'coverage'
 
 
+def test_f09_complete_run_marked_complete(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    seed_data_dir(tmp_data_dir, *_world(), target_tiles=[TILE])
+    out_dir = tmp_path / 'out'
+    result = _run_all(cli_runner, tmp_data_dir, out_dir)
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    html, data = _report(out_dir)
+    assert 'INCOMPLETE' not in html
+    assert data['run_status']['state'] == 'COMPLETE'
+    status = json.loads((out_dir / 'run_status.json').read_text())
+    assert status['state'] == 'COMPLETE'
+    assert status['checks_done'] == ['duplicates', 'ordering', 'confirmation', 'inputs', 'coverage']
+
+
 # aa2014f: ModuleNotFoundError: no dist_s1_prod_check.status (no run status is ever written or read).
-@pytest.mark.xfail(strict=True, reason='F09: a run_status.json left at RUNNING must read as INCOMPLETE')
 def test_f09_stale_running_status_reads_incomplete(tmp_path: Path) -> None:
     from dist_s1_prod_check import status
 
