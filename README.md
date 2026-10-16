@@ -1,29 +1,22 @@
 # dist-s1-prod-check
 
-Validation checks for the OPERA DIST-S1 production system. Cross-references product metadata
-(GeoTIFF tags), NASA CMR granule metadata, and the expected enumeration from
-[dist-s1-enumerator](https://github.com/opera-adt/dist-s1-enumerator) at global scale.
+Validation checks for the OPERA DIST-S1 production system, used as its production gate. Cross-references product
+metadata (GeoTIFF tags), NASA CMR granule metadata (or a producing cluster's bucket), and the expected enumeration
+from [dist-s1-enumerator](https://github.com/opera-adt/dist-s1-enumerator) at global scale.
 
 ## Checks
 
-1. **download-metadata** - DIST-S1 + RTC-S1 granule metadata from CMR into geoparquet tables
-   (direct CMR queries, temporally chunked and threaded; no per-product API calls).
-2. **check-duplicates** - DIST-S1 granules sharing the same tile/acquisition. The last-processed
-   granule of a group is taken as the correct one; every other check runs on that granule only.
-3. **check-ordering** - processing order matches acquisition order within each MGRS tile. Each
-   product is compared against the previous acquisition in its tile, and reprocessed acquisitions
-   are excluded (their retained version is processed late by construction, which would otherwise
-   flag both it and everything acquired after it in the tile — a duplicate masquerading as an
-   ordering failure).
-4. **check-confirmation** - each product's `prior_dist_s1_product` tag points to the previous
-   product in its tile time series.
-5. **check-inputs** - recorded pre/post RTC-S1 inputs match a re-enumeration
-   (`--mode offline` re-enumerates from the local RTC table; `--mode online` hits ASF per product).
-6. **check-coverage** - every RTC-S1 pass with baseline imagery has a DIST-S1 product.
+`run-all` runs every check and writes one combined report; each also exists as a standalone command.
 
-Each check writes timestamped CSVs (all results + failures with expected vs. actual) and an
-HTML report with a clickable map of failing MGRS tiles (popups show product ids, reasons, and
-layer links) and filterable tables with CSV export. `run-all` produces one combined report.
+1. **Duplicates** (`check-duplicates`): one DIST-S1 version per tile and acquisition.
+2. **Processing order** (`check-ordering`): two views, first production over every version, and retained versions.
+3. **Confirmation chain** (`check-confirmation`): each product's `prior_dist_s1_product` is the latest version of
+   the previous acquisition that existed when the product was processed.
+4. **Product inputs** (`check-inputs`): recorded pre/post RTC-S1 inputs equal a re-enumeration
+   (`--mode offline` from the cached RTC table; `--mode online` queries ASF per product).
+5. **Coverage and orphans** (`check-coverage`): every eligible RTC-S1 pass has a product, and every product a pass.
+
+Contracts, units, every status and reason string, and the known limits are in [docs/CHECKS.md](docs/CHECKS.md).
 
 ## Setup
 
@@ -36,7 +29,9 @@ Earthdata credentials are required (the DIST-S1 CMR collection and the DAAC GeoT
 gated): put them in `~/.netrc` (`machine urs.earthdata.nasa.gov login ... password ...`) or
 let `earthaccess.login()` prompt once.
 
-## Weekend run (checks 1-6, global, Jan-Mar 2026)
+## Gate workflow
+
+A gate run downloads fresh metadata, fetches tags, and runs every check over the whole window and AOI:
 
 ```bash
 pixi shell
@@ -44,21 +39,56 @@ nohup dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 \
     --data-dir data --out-dir outputs > run_all.log 2>&1 &
 ```
 
-Everything heavy is resumable: metadata tables are only re-downloaded with `--refresh` (the RTC-S1
-download also checkpoints each CMR chunk to `data/rtc_s1_chunks/` until the table is written), tag
-fetching (one DAAC read per product, ~230k globally) caches to `data/dist_s1_tags.parquet`, and
-the offline inputs check checkpoints per tile to `data/inputs_check_results.parquet` — a rerun
-of the same command picks up where it left off. The inputs check runs in `--inputs-workers`
-processes (default 8; raise on a many-core server). `--refresh` clears the inputs checkpoint
-along with the metadata tables since results depend on the RTC table. CSVs are written as each
-check completes and the HTML report is written even if a later check fails, so a crash never
-discards finished work.
+Then, before reading any count:
 
-Over an AOI instead:
+1. Open `outputs/latest`: it names the run directory, `outputs/<stamp>_<6 hex>/`. Each run writes only there, so
+   runs never mix their files.
+2. Read `run_status.json` in it. Only `"state": "COMPLETE"` means every check ran and every file was written (files
+   are written to temporary names and renamed; COMPLETE is written last). `RUNNING` read later means the process
+   died; `INCOMPLETE` names `failed_check`, `error` and the checks `not_run`. The HTML report of an incomplete run
+   opens with a red INCOMPLETE banner and grey tiles for the checks that did not finish.
+3. Read the report's **provenance block** (generated only from `run_manifest.json`): command line, tool and
+   enumerator versions, venue, window and AOI, product versions and exclusions, processing and window filters,
+   sampling (if any), RTC-S1 rows dropped building the input frame, every cached table with its provenance, and what
+   is not checked (layer completeness). An orange **ADOPTED CACHE** banner means the run used `adopt-cache`d tables
+   and cannot serve as a gate.
+4. Read each section: "N failed of M checked (unit)" with the per-status counts. A section is green only when it is
+   COMPLETE, has no FAIL and no UNKNOWN, and evaluated something. UNKNOWN is never green.
 
-```bash
-dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 --bbox -120 34 -118 36
-```
+**Never use sampling for the gate.** `--sample-tiles N` (every check on N random tiles, full time series) and
+`--sample-inputs N` (confirmation and inputs on N products) are for fast iteration. Sampled sections are labelled
+SAMPLED with the sample size, seed and a digest of the selected ids in the provenance.
+
+## Caches and manifests
+
+Every cached metadata table has a manifest next to it (`<table>.manifest.json`): venue, source, acquisition window,
+AOI, every query window with its completeness, per-chunk CMR hits and rows, query time, row count and the parquet's
+sha256 (checked on every load). A run refuses a cache that does not match its request (venue, window not inside the
+cached one, AOI, incomplete query, changed parquet, no manifest) and says how to fix it. A missing `venue.txt` next
+to an existing cache is refused, never taken as PROD.
+
+- **`--refresh`** re-downloads both metadata tables and deletes the inputs checkpoint and the RTC chunk
+  checkpoints. `download-metadata` also deletes the inputs checkpoint.
+- **RTC chunk checkpoints** (`rtc_s1_chunks*/`, removed once the table is written) are reused on resume only if
+  their manifest matches the query and the chunk's acquisitions ended at least 30 days before it was queried.
+- **Tags** (`dist_s1_tags.parquet`) record the URL each row was read from; a row is reused only if that URL is still
+  the one the product resolves to (`alert_url` or `--tag-url-template`). Rows with a read error are retried, except
+  with `--offline`.
+- **Inputs checkpoint** (`inputs_check_results.parquet`): each row stores a fingerprint of the RTC table, the
+  product's tag row, tool and enumerator versions and options; anything that changes recomputes it. Rows that could
+  not be checked are never checkpointed.
+- **Schema validation** on load refuses null acquisition or processing times, duplicate ids and wrong dtypes.
+- **`--offline`** uses cached data only: any step needing the network fails naming the step; cached tag errors stay
+  UNKNOWN "(not retried: offline)".
+- **`adopt-cache`** writes `adopted_unverified` manifests (and asserts each tag row's `source_url` and the venue) for
+  a cache built before manifests existed. Such caches are accepted only with `--regression-baseline`, never for a
+  gate report.
+
+## Product versions and campaigns
+
+Only DIST-S1 v1.0 products are checked by default (`--product-versions v1.0`; a comma list widens it). Excluded
+products are counted per version in the report header. Within a version, deduplication keeps the last-processed
+product of each tile and acquisition (ties: greatest id).
 
 **UAT venue** (DIST-S1 products delivered to ASF UAT, e.g. from a test-venue replay):
 
@@ -85,21 +115,21 @@ dist-s1-prod-check run-all --venue OPS-POP1 --start 2026-01-01 --stop 2026-03-01
 ```
 
 DIST-S1 metadata comes from listing `s3://opera-ops-rs-pop1/products/DIST_S1/{acq YYYY/MM/DD}/`
-anonymously (one request per day, no CMR or Earthdata login), and GeoTIFF tags are read from the
-same bucket over HTTPS. The bucket holds what the cluster produced, which may differ from what was
-delivered to ASF. RTC-S1 inputs still come from PROD CMR.
+anonymously (every key, so a product whose STATUS layer is missing is seen and reported UNKNOWN; no CMR or
+Earthdata login), and GeoTIFF tags are read from the same bucket over HTTPS. The bucket holds what the cluster
+produced, which may differ from what was delivered to ASF. RTC-S1 inputs still come from PROD CMR.
 
-**Fast iteration on a sample** (reuses all serialized data; seconds-to-minutes per run):
+## Fast iteration
 
 ```bash
 dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 \
     --data-dir data_global --out-dir outputs_sample --sample-tiles 100
 ```
 
-`--sample-tiles N` restricts every check to N random MGRS tiles but keeps each tile's full
-product time series, so chain-based checks (confirmation, ordering, coverage) stay valid.
-Same `--seed` (default 42) means the same tiles every run; change it to see different ones.
-Tags fetched for the sample land in the shared cache, so the eventual full run reuses them.
+Same `--seed` (default 42) means the same tiles every run. Tags fetched for a sample land in the shared cache.
+
+Over an AOI: `--bbox lon_min lat_min lon_max lat_max` (resolved to the overlapping MGRS tiles; the RTC-S1 query is
+widened to their full burst footprints; antimeridian-crossing AOIs are not handled).
 
 Individual checks after `download-metadata` / `fetch-tags`:
 
@@ -110,18 +140,18 @@ dist-s1-prod-check check-duplicates
 dist-s1-prod-check check-ordering
 dist-s1-prod-check check-confirmation
 dist-s1-prod-check check-inputs            # offline, uses the RTC table
-dist-s1-prod-check check-inputs --mode online --sample 100   # recent products, live ASF
+dist-s1-prod-check check-inputs --mode online --sample 100   # live ASF
 dist-s1-prod-check check-coverage --start 2026-01-01 --stop 2026-03-01
 ```
 
-## Notebooks
+## Outputs
 
-```bash
-pixi run jupyter lab
-```
-
-- `notebooks/0_download_and_check.ipynb` - the full workflow as library calls.
-- `notebooks/1_investigate_aoi.ipynb` - products + RTC inputs over a bbox.
+Per run directory: one CSV per result table (`<name>_<stamp>.csv`, e.g. `confirmation`, `inputs`, `coverage`, their
+`_failures`/`_missing` subsets, `ordering_tiles`, `coverage_orphans`), `report_<stamp>.html`, `run_manifest.json`
+and `run_status.json`. The report embeds its data (tables up to 50,000 rows each, labelled when truncated; the map
+counts every failure, with rows that have no tile counted in the legend) and loads Leaflet and basemap tiles from
+CDNs; without them the map says so and everything else still renders. `dist_s1_prod_check.reconcile.reconcile_run`
+checks that a run's report and CSVs agree.
 
 ## Memory at global scale
 
@@ -130,22 +160,7 @@ inputs check enumerates and compares one MGRS tile at a time, and coverage group
 prefiltered to the check window. Measured: 680 B/row for the RTC table, so the global Jan-Mar
 2026 run peaks around 12-16 GB (RTC table ~5 GB + LUT-joined frame ~7 GB + bounded transients).
 
-## Notes
+## Development
 
-- AOI runs resolve the bbox to its overlapping MGRS tiles and widen the RTC-S1 query to the
-  full burst footprints of those tiles (stored in `data/target_mgrs_tiles.txt`); without this,
-  edge products appear to use "unexpected" inputs. Antimeridian-crossing AOIs are not handled.
-- The first product per tile inside the queried window cannot have its prior validated
-  (the true prior falls before the window); it is skipped unless `--expect-none-at-start`
-  (mission-start semantics) is passed.
-- The HTML report loads Leaflet and basemap tiles from CDNs, so it needs internet when opened;
-  all data is embedded in the file.
-- Coverage baseline logic mirrors the enumerator defaults: lookback windows at 365/730/1095
-  days, 60-day width, max 4/3/3 pre-images per burst, min 1.
-- **Polarization**: only dual-polarization RTC-S1 (`VV+VH`, `HH+HV`) is ever used - single-pol
-  granules are dropped when the RTC input frame is built and are never post-images or baseline
-  imagery. A burst's baseline must also match its post-image: a `VV+VH` post-image can only be
-  paired with `VV+VH` pre-images, and likewise for `HH+HV`. Coverage counts a burst as having a
-  baseline only when the lookback windows hold same-polarization acquisitions, and the inputs
-  check reports `Pre RTC baseline polarization mismatch` / `Single polarization input used` for
-  products that violate this.
+Tests: `pytest -q` (offline; the `data` tests use the real-data subset in `tests/data/`; the report-rendering tests
+need `node`). Lint: `ruff check . && ruff format --check .`.
