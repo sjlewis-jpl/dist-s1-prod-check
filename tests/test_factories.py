@@ -101,6 +101,10 @@ def test_schemas_match_real_caches(tmp_path: Path) -> None:
     for reader, name, frame in pairs:
         real = reader(REAL_DIR / name)
         seeded = reader(tmp_path / name)
+        if name == TAGS_PARQUET:
+            # The real caches predate source_url (F23, Phase 2), which seed_data_dir records like fetch_tags_table.
+            assert seeded.source_url.dtype == real.opera_id.dtype
+            seeded = seeded.drop(columns='source_url')
         assert list(frame.columns) == list(real.columns), name
         pd.testing.assert_series_equal(frame.dtypes, real.dtypes, check_names=False, obj=f'{name} in memory')
         pd.testing.assert_series_equal(seeded.dtypes, real.dtypes, check_names=False, obj=f'{name} round trip')

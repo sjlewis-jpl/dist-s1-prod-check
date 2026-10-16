@@ -27,7 +27,7 @@ from dist_s1_prod_check.constants import (
     VENUE_FILE,
 )
 from dist_s1_prod_check.ids import get_opera_id_trunc, get_track_number
-from dist_s1_prod_check.tags import TAG_KEYS
+from dist_s1_prod_check.tags import TAG_KEYS, resolve_tag_urls
 
 
 TimeLike = str | datetime | pd.Timestamp
@@ -345,6 +345,11 @@ def seed_data_dir(
             **common,
         )
     if tags is not None:
+        if 'source_url' not in tags.columns and (data_dir / DIST_S1_PARQUET).exists():
+            # As if fetched from each product's alert_url, so run-all reuses the rows instead of refetching (F23).
+            df_dist = pd.read_parquet(data_dir / DIST_S1_PARQUET)
+            url_by_id = dict(zip(df_dist.opera_id, resolve_tag_urls(df_dist)))
+            tags = tags.assign(source_url=tags.opera_id.map(url_by_id).fillna(''))
         tags.to_parquet(data_dir / TAGS_PARQUET, compression='zstd')
     (data_dir / VENUE_FILE).write_text(f'{venue}\n')
     return data_dir

@@ -135,9 +135,6 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
     shutil.copytree(subset, data_dir)
     # The subset was cut from caches built before manifests existed: adopt the copy with the baseline's arguments.
     adopt_args = [a for a in VENUE_ARGS[venue] if a not in ('--processing-start', '2026-09-24')]
-    adopt_args = (
-        adopt_args[: adopt_args.index('--tag-url-template')] if '--tag-url-template' in adopt_args else adopt_args
-    )
     adopted = cli_runner.invoke(cli, ['adopt-cache', *adopt_args, '--data-dir', str(data_dir)])
     assert adopted.exit_code == 0, adopted.output
 

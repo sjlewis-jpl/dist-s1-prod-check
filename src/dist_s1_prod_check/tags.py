@@ -44,19 +44,28 @@ def _preflight(url: str) -> None:
 
 
 def _fetch_one(record: dict) -> dict:
-    out = {'opera_id': record['opera_id'], 'error': ''}
+    out = {'opera_id': record['opera_id'], 'error': '', 'source_url': record['alert_url']}
     try:
         tags = get_tags(record['alert_url'])
         out.update({key: tags.get(key, '') for key in TAG_KEYS})
     except Exception as e:
         out.update(dict.fromkeys(TAG_KEYS, ''))
         out['error'] = f'{type(e).__name__}: {e}'
-    return out
+    return {k: out[k] for k in CACHE_COLUMNS}
 
 
 MISSING_TAG_URL = 'missing_tag_url'
 NO_CACHED_TAG_ROW = 'no cached tag row (run fetch-tags)'
 TAG_COLUMNS = ['opera_id', 'error', *TAG_KEYS]
+# The cached table also records the URL each row was read from (F23).
+CACHE_COLUMNS = [*TAG_COLUMNS, 'source_url']
+
+
+def cached_source_urls(df_tags: pd.DataFrame) -> pd.Series:
+    """`source_url` of each cached row; '' for rows cached before it was recorded (never matches a URL)."""
+    if 'source_url' not in df_tags.columns:
+        return pd.Series('', index=df_tags.index, dtype=str)
+    return df_tags.source_url.fillna('').astype(str)
 
 
 def resolve_tag_urls(df_products: pd.DataFrame, url_template: str | None = None) -> pd.Series:
@@ -119,22 +128,34 @@ def fetch_tags_table(
     Returns exactly one row per product of `df_products`, in its order (F03): a product with no URL gets
     ``error='missing_tag_url'`` (in the returned frame only; nothing was read, so nothing is cached).
 
+    Each cached row records `source_url`, the URL it was read from, and is reused only if that equals the URL the
+    product resolves to now (F23): changing `url_template` refetches every product, and a cache written before
+    `source_url` existed is refetched in full (`adopt-cache --tag-url-template` can assert it instead).
+
     In offline mode cached rows holding a read error are kept, not retried, with `(not retried: offline)`
     appended to their error in the returned frame (never in the parquet), and any product with no cached row
     raises `OfflineError`.
     """
     out_path = Path(out_path)
     urls = resolve_tag_urls(df_products, url_template)
-    df_existing = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=TAG_COLUMNS)
+    df_existing = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=CACHE_COLUMNS)
+    df_existing = df_existing.assign(source_url=cached_source_urls(df_existing))
     offline = is_offline()
     df_reuse = df_existing[df_existing.error == ''] if retry_errors and not offline else df_existing
+    df_reuse = df_reuse.drop_duplicates(subset='opera_id', keep='last')
 
-    todo_mask = urls.notna() & ~df_products.opera_id.isin(df_reuse.opera_id)
+    cached_url = df_products.opera_id.map(df_reuse.set_index('opera_id').source_url)
+    todo_mask = urls.notna() & (cached_url != urls)
     records = [{'opera_id': o, 'alert_url': u} for o, u in zip(df_products.opera_id[todo_mask], urls[todo_mask])]
     if offline and records:
-        network_allowed(f'fetching tags for {len(records)} products with no cached tag row')
+        n_stale = int((todo_mask & cached_url.notna()).sum())
+        network_allowed(
+            f'fetching tags for {len(records)} products with no cached tag row or one read from another URL '
+            f'({n_stale} with another source_url)'
+        )
     if records:
-        df_reuse = _fetch_into(records, df_reuse, out_path, max_workers, batch_size)
+        stale = df_reuse.opera_id.isin({r['opera_id'] for r in records})
+        df_reuse = _fetch_into(records, df_reuse[~stale], out_path, max_workers, batch_size)
     df = align_to_products(df_products, df_reuse, urls)
     if offline:
         failed = (df.error != '') & (df.error != MISSING_TAG_URL)

@@ -199,7 +199,7 @@ def prepare_repro(name: str, tag: str | None, drop_inputs_checkpoint: bool, base
     return args
 
 
-ADOPT_FLAGS = {'--start': 1, '--stop': 1, '--bbox': 4, '--venue': 1, '--data-dir': 1}
+ADOPT_FLAGS = {'--start': 1, '--stop': 1, '--bbox': 4, '--venue': 1, '--data-dir': 1, '--tag-url-template': 1}
 
 
 def adopt_args(run_args: list[str]) -> list[str]:

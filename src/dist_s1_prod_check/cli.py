@@ -512,6 +512,28 @@ def download_metadata(
     click.echo(f'RTC-S1: {len(df_rtc)} granules -> {data_dir / RTC_S1_PARQUET}')
 
 
+def _adopt_tag_sources(data_dir: Path, url_template: str | None) -> None:
+    """Fill a missing `source_url` in the cached tag table with the URL each product resolves to (asserted)."""
+    tags_path = data_dir / TAGS_PARQUET
+    if not tags_path.exists():
+        return
+    df_tags = pd.read_parquet(tags_path)
+    current = tags.cached_source_urls(df_tags)
+    df_dist = pd.read_parquet(data_dir / DIST_S1_PARQUET)
+    resolved = tags.resolve_tag_urls(df_dist, url_template)
+    url_by_id = pd.Series(resolved.to_numpy(), index=df_dist.opera_id.to_numpy())
+    fill = (current == '') & df_tags.opera_id.isin(url_by_id.dropna().index)
+    df_tags['source_url'] = current.where(~fill, df_tags.opera_id.map(url_by_id))
+    tmp = tags_path.with_suffix('.parquet.tmp')
+    df_tags.to_parquet(tmp, compression='zstd')
+    tmp.replace(tags_path)
+    source = f'template {url_template}' if url_template else 'alert_url'
+    click.echo(
+        f'Recorded source_url ({source}) for {int(fill.sum())} of {len(df_tags)} cached tag rows (asserted, not '
+        f'verified); {int((df_tags.source_url == "").sum())} rows have none and will be refetched.'
+    )
+
+
 @cli.command()
 @click.option('--start', required=True, help='--start of the run that built the cache.')
 @click.option('--stop', required=True, help='--stop of the run that built the cache.')
@@ -525,10 +547,22 @@ def download_metadata(
 @click.option(
     '--rtc-source', default='PROD CMR', show_default=True, help='Where the RTC-S1 table came from, as recorded.'
 )
+@click.option(
+    '--tag-url-template',
+    default=None,
+    help="--tag-url-template of the run that fetched the cached tags, if any; recorded as each row's source_url.",
+)
 @venue_option
 @data_dir_option
 def adopt_cache(
-    start: str, stop: str, bbox: tuple, lookback: bool, rtc_source: str, venue: str, data_dir: Path
+    start: str,
+    stop: str,
+    bbox: tuple,
+    lookback: bool,
+    rtc_source: str,
+    tag_url_template: str | None,
+    venue: str,
+    data_dir: Path,
 ) -> None:
     """Write manifests for a cache built before manifests existed, from the arguments that built it.
 
@@ -571,6 +605,7 @@ def adopt_cache(
             **common,
         )
         click.echo(f'Adopted {rtc_path} ({m.n_rows} rows, {len(m.lookback_windows)} query windows claimed complete)')
+    _adopt_tag_sources(data_dir, tag_url_template)
     click.echo('Adopted caches are usable only with --regression-baseline.')
 
 

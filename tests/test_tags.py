@@ -127,3 +127,72 @@ def test_f03_universe_assertion_raises_on_dropped_product() -> None:
         cli_mod._require_one_row_per_product(df, pd.Series(['a', 'b', 'c']), 'inputs')
     with pytest.raises(RuntimeError, match='duplicated'):
         cli_mod._require_one_row_per_product(pd.concat([df, df]), pd.Series(['a', 'b']), 'confirmation', unique=True)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# F23: the tag cache ignored the tag source (URL template).
+
+
+def _counting_get_tags(calls: list[str]) -> object:
+    reader = _fake_get_tags(set(), {})
+
+    def get_tags(url: str) -> dict[str, str]:
+        calls.append(url)
+        return reader(url)
+
+    get_tags.retry_with = lambda **kwargs: get_tags
+    return get_tags
+
+
+# c27b56b: the second fetch with template B returned the rows read from template A; no URL was read.
+def test_f23_template_change_refetches_and_records_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    df = _products(2)
+    out = tmp_path / 'tags.parquet'
+    calls: list[str] = []
+    monkeypatch.setattr(tags, 'get_tags', _counting_get_tags(calls))
+    template_a = 'https://a.example/{opera_id}/{opera_id}_GEN-DIST-STATUS.tif'
+    template_b = 'https://b.example/{acq_time:%Y/%m/%d}/{opera_id}/{opera_id}_GEN-DIST-STATUS.tif'
+
+    urls_a = [template_a.format(**r) for r in df.to_dict('records')]
+    urls_b = [template_b.format(**r) for r in df.to_dict('records')]
+
+    first = tags.fetch_tags_table(df, out, max_workers=1, url_template=template_a)
+    assert set(calls) == set(urls_a)  # the preflight reads the first URL once more
+    assert first.source_url.tolist() == urls_a
+
+    n_calls = len(calls)
+    tags.fetch_tags_table(df, out, max_workers=1, url_template=template_a)
+    assert len(calls) == n_calls, 'rows read from the same URL must be reused'
+
+    second = tags.fetch_tags_table(df, out, max_workers=1, url_template=template_b)
+    assert set(calls[n_calls:]) == set(urls_b), 'rows read from another URL must be refetched'
+    assert second.source_url.tolist() == urls_b
+    cached = pd.read_parquet(out)
+    assert cached.opera_id.is_unique and set(cached.source_url) == set(second.source_url)
+
+
+def test_f23_offline_source_mismatch_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from dist_s1_prod_check import network
+
+    df = _products(1)
+    out = tmp_path / 'tags.parquet'
+    legacy = make_tags([{'opera_id': df.opera_id.iloc[0]}])  # cached before source_url was recorded
+    legacy.to_parquet(out)
+    network.set_offline(True)
+    try:
+        with pytest.raises(network.OfflineError, match='another source_url'):
+            tags.fetch_tags_table(df, out, max_workers=1)
+    finally:
+        network.set_offline(False)
+
+
+def test_f23_adopt_cache_records_tag_source(tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    df = _products(2)
+    seed_data_dir(tmp_data_dir, dist=df, target_tiles=[TILE])
+    make_tags([{'opera_id': o} for o in df.opera_id]).to_parquet(tmp_data_dir / 'dist_s1_tags.parquet')
+    template = 'http://bucket.example/{acq_time:%Y/%m/%d}/{opera_id}/{opera_id}_GEN-DIST-STATUS.tif'
+    args = ['adopt-cache', '--start', '2026-01-01', '--stop', '2026-03-01', '--tag-url-template', template]
+    result = cli_runner.invoke(cli, [*args, '--data-dir', str(tmp_data_dir)])
+    assert result.exit_code == 0, result.output
+    cached = pd.read_parquet(tmp_data_dir / 'dist_s1_tags.parquet')
+    assert cached.source_url.tolist() == [template.format(**r) for r in df.to_dict('records')]
