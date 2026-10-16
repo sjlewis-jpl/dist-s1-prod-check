@@ -21,6 +21,7 @@ from factories import (
     make_rtc,
     make_tags,
     rtc_id,
+    run_dir,
     seed_data_dir,
 )
 
@@ -123,8 +124,8 @@ def test_check_duplicates_offline(
     out_dir = tmp_path / 'out'
     result = cli_runner.invoke(cli, ['check-duplicates', '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir)])
     assert result.exit_code == 0, result.output + repr(result.exception)
-    csvs = list(out_dir.glob('*.csv'))
+    csvs = list(run_dir(out_dir).glob('*.csv'))
     assert csvs, f'no CSV written in {out_dir}'
     df = pd.concat(pd.read_csv(p) for p in csvs if p.stat().st_size > 1)
     assert len(df) == 2 and df.is_latest.sum() == 1
-    assert list(out_dir.glob('report_*.html'))
+    assert list(run_dir(out_dir).glob('report_*.html'))

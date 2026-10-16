@@ -309,7 +309,9 @@ def write_html_report(
         .replace('__DATA__', data_js)
     )
     out_path = Path(out_path)
-    out_path.write_text(html)
+    tmp = out_path.with_suffix('.html.tmp')
+    tmp.write_text(html)
+    tmp.replace(out_path)  # F34: never a half-written report
     return out_path
 
 

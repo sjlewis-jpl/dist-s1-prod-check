@@ -281,6 +281,13 @@ def bursts_for_tile(tile: str) -> pd.DataFrame:
     return get_lut_by_mgrs_tile_ids([tile.removeprefix('T')]).reset_index(drop=True)
 
 
+def run_dir(out_dir: Path) -> Path:
+    """Return the newest run directory a CLI command wrote under ``--out-dir`` (F34), else ``out_dir``."""
+    from dist_s1_prod_check.cli import latest_run_directory
+
+    return latest_run_directory(Path(out_dir))
+
+
 def seed_data_dir(
     data_dir: Path,
     dist: gpd.GeoDataFrame | None = None,

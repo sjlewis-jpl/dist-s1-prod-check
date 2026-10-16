@@ -17,7 +17,7 @@ from click.testing import CliRunner, Result
 from dist_s1_prod_check import cmr, coverage, tags
 from dist_s1_prod_check.cli import cli
 from dist_s1_prod_check.constants import DELTA_WINDOW_DAYS, INPUTS_CHECKPOINT_PARQUET
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, run_dir, seed_data_dir
 
 
 TILE = '10SGC'
@@ -102,13 +102,13 @@ def _run_all(runner: CliRunner, data_dir: Path, out_dir: Path, *extra: str) -> R
 
 
 def _csv(out_dir: Path, name: str) -> pd.DataFrame:
-    paths = sorted(out_dir.glob(f'{name}_[0-9]*T[0-9]*.csv'))
-    assert paths, f'no {name} CSV in {out_dir}: {sorted(p.name for p in out_dir.iterdir())}'
+    paths = sorted(run_dir(out_dir).glob(f'{name}_[0-9]*T[0-9]*.csv'))
+    assert paths, f'no {name} CSV in {out_dir}: {sorted(p.name for p in run_dir(out_dir).iterdir())}'
     return pd.read_csv(paths[-1]) if paths[-1].stat().st_size > 1 else pd.DataFrame()
 
 
 def _report(out_dir: Path) -> tuple[str, dict[str, Any]]:
-    paths = sorted(out_dir.glob('report_*.html'))
+    paths = sorted(run_dir(out_dir).glob('report_*.html'))
     assert paths, f'no HTML report in {out_dir}'
     html = paths[-1].read_text()
     marker = 'const DATA = '
@@ -119,7 +119,7 @@ def _report(out_dir: Path) -> tuple[str, dict[str, Any]]:
 def _all_output_text(out_dir: Path) -> str:
     if not out_dir.exists():
         return ''
-    return '\n'.join(p.read_text() for p in out_dir.iterdir() if p.suffix in ('.csv', '.html', '.json'))
+    return '\n'.join(p.read_text() for p in out_dir.rglob('*') if p.suffix in ('.csv', '.html', '.json'))
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -303,7 +303,7 @@ def test_f09_crash_marks_run_incomplete(
     assert 'INCOMPLETE' in html, 'partial HTML report carries no INCOMPLETE banner'
     assert 'coverage' in html.lower()
 
-    status_path = out_dir / 'run_status.json'
+    status_path = run_dir(out_dir) / 'run_status.json'
     assert status_path.exists(), 'no run_status.json'
     status = json.loads(status_path.read_text())
     assert status.get('state', status.get('status')) == 'INCOMPLETE'
@@ -318,7 +318,7 @@ def test_f09_complete_run_marked_complete(tmp_path: Path, tmp_data_dir: Path, cl
     html, data = _report(out_dir)
     assert 'INCOMPLETE' not in html
     assert data['run_status']['state'] == 'COMPLETE'
-    status = json.loads((out_dir / 'run_status.json').read_text())
+    status = json.loads((run_dir(out_dir) / 'run_status.json').read_text())
     assert status['state'] == 'COMPLETE'
     assert status['checks_done'] == ['duplicates', 'ordering', 'confirmation', 'inputs', 'coverage']
 
@@ -380,7 +380,7 @@ def test_f10_sample_tiles_disclosed_with_actual_count(
     _, data = _report(out_dir)
     assert 'sample of 1 of 1 tiles (seed 3)' in data['subtitle']
     assert {s['state'] for s in data['sections']} == {'SAMPLED'}
-    sampling = json.loads((out_dir / 'run_manifest.json').read_text())['sampling']
+    sampling = json.loads((run_dir(out_dir) / 'run_manifest.json').read_text())['sampling']
     assert (sampling['tiles']['n_selected'], sampling['tiles']['seed']) == (1, 3)
 
 
@@ -477,7 +477,7 @@ def test_f31_dist_outside_window_excluded_and_counted(
     result = _run_all(cli_runner, tmp_data_dir, out_dir)
     assert result.exit_code == 0, result.output + repr(result.exception)
     assert early not in _all_output_text(out_dir)
-    run_manifest = json.loads((out_dir / 'run_manifest.json').read_text())
+    run_manifest = json.loads((run_dir(out_dir) / 'run_manifest.json').read_text())
     assert run_manifest['window_filter'] == {'start': '2026-01-01', 'stop': '2026-02-01', 'n_before': 4, 'n_kept': 3}
     html, _ = _report(out_dir)
     assert 'outside the acquisition window' in html
@@ -525,7 +525,7 @@ def test_f30_rtc_frame_drops_recorded(tmp_path: Path, tmp_data_dir: Path, cli_ru
     out_dir = tmp_path / 'out'
     result = _run_all(cli_runner, tmp_data_dir, out_dir)
     assert result.exit_code == 0, result.output + repr(result.exception)
-    drops = json.loads((out_dir / 'run_manifest.json').read_text())['rtc_frame_drops']
+    drops = json.loads((run_dir(out_dir) / 'run_manifest.json').read_text())['rtc_frame_drops']
     assert drops == {'single_polarization': 1, 'null_geometry': 1, 'not_in_lut': 1}
     html, _ = _report(out_dir)
     assert 'RTC-S1 rows dropped' in html and 'single polarization 1' in html
@@ -543,5 +543,5 @@ def test_f20_orphans_section_and_empty_csv_header(tmp_path: Path, tmp_data_dir: 
     _, data = _report(out_dir)
     (orphans,) = [s for s in data['sections'] if s['key'] == 'orphans']
     assert (orphans['n_universe'], orphans['n_unknown'], orphans['green']) == (3, 0, True)
-    (path,) = out_dir.glob('coverage_orphans_2*.csv')
+    (path,) = run_dir(out_dir).glob('coverage_orphans_2*.csv')
     assert path.read_text().splitlines()[0].startswith('opera_id,mgrs_tile_id'), path.read_text()[:80]

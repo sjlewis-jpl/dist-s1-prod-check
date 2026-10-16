@@ -18,7 +18,7 @@ from dist_s1_enumerator.mgrs_burst_data import get_mgrs_table
 from dist_s1_prod_check import cli as cli_mod
 from dist_s1_prod_check import report
 from dist_s1_prod_check.cli import cli
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, run_dir, seed_data_dir
 
 
 TILE = '11SLT'
@@ -84,7 +84,7 @@ def test_f11_processing_start_after_all_products_gives_empty_sections(
             '--out-dir', str(out_dir),
         ],
     )  # fmt: skip
-    sections = _payload(next(out_dir.glob('report_*.html')))['sections']
+    sections = _payload(next(run_dir(out_dir).glob('report_*.html')))['sections']
     assert sections
     for sec in sections:
         assert sec['n_checked'] == 0

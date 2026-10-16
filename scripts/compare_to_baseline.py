@@ -415,7 +415,9 @@ def main(argv: list[str] | None = None) -> int:
     """Run the comparison from the command line; return the process exit code."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('baseline', help='Baseline name in baselines.json, e.g. pop1_aoi.')
-    parser.add_argument('new_out_dir', type=Path, help='Output directory of the run to compare.')
+    parser.add_argument(
+        'new_out_dir', type=Path, help='Run directory to compare, or an --out-dir (its `latest` run is used).'
+    )
     parser.add_argument('--phase', default='adhoc', help='Name of the delta subdirectory (default: adhoc).')
     parser.add_argument('--new-stamp', default=None, help='Stamp of the new run (default: the latest in the dir).')
     parser.add_argument('--baselines', type=Path, default=DEFAULT_BASELINES)
@@ -430,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
     entry = baselines['baselines'][args.baseline]
     old_dir = data_path(baselines, entry['outputs'])
     new_dir = args.new_out_dir.expanduser().resolve()
+    if (new_dir / 'latest').exists():  # an --out-dir holding per-run directories (F34): use the newest run
+        new_dir = new_dir / (new_dir / 'latest').read_text().strip()
     new_stamp = _pick_stamp(new_dir, args.new_stamp)
     deltas_dir = data_path(baselines, baselines['deltas_root']) / args.baseline / args.phase
 

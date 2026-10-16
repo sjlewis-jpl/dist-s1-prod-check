@@ -10,7 +10,7 @@ from click.testing import CliRunner
 from dist_s1_prod_check import checks
 from dist_s1_prod_check import cli as cli_module
 from dist_s1_prod_check.cli import cli
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, run_dir, seed_data_dir
 
 
 TILE = '10SGC'
@@ -181,10 +181,10 @@ def test_run_all_excludes_other_versions(tmp_path: Path, tmp_data_dir: Path, cli
     args = ['run-all', '--start', '2026-01-01', '--stop', '2026-03-01', '--inputs-workers', '1']
     result = cli_runner.invoke(cli, [*args, '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir)])
     assert result.exit_code == 0, result.output + repr(result.exception)
-    html = next(out_dir.glob('report_*.html')).read_text()
+    html = next(run_dir(out_dir).glob('report_*.html')).read_text()
     assert 'excluded 1 products of other versions (v0.1: 1)' in html
     assert v01 not in html
-    duplicates = pd.read_csv(next(out_dir.glob('duplicates_*.csv')))
+    duplicates = pd.read_csv(next(run_dir(out_dir).glob('duplicates_*.csv')))
     assert duplicates.empty, 'the v0.1 product must not form a duplicate group with the v1.0 one'
 
 

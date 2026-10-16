@@ -10,7 +10,7 @@ from click.testing import CliRunner, Result
 from dist_s1_prod_check import manifest
 from dist_s1_prod_check.cli import cli
 from dist_s1_prod_check.constants import DIST_S1_PARQUET, RTC_S1_PARQUET
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, run_dir, seed_data_dir
 
 
 TILE = '10SGC'
@@ -78,7 +78,7 @@ def test_cache_without_manifest_rejected(tmp_path: Path, tmp_data_dir: Path) -> 
     result = _run_all(tmp_data_dir, tmp_path / 'out')
     assert result.exit_code != 0
     assert 'no manifest' in result.output and '--refresh' in result.output and 'adopt-cache' in result.output
-    status = json.loads((tmp_path / 'out' / 'run_status.json').read_text())
+    status = json.loads((run_dir(tmp_path / 'out') / 'run_status.json').read_text())
     assert (status['state'], status['failed_check']) == ('INCOMPLETE', 'setup')
 
 
@@ -93,15 +93,15 @@ def test_adopted_cache_needs_regression_flag(tmp_path: Path, tmp_data_dir: Path)
     refused = _run_all(tmp_data_dir, tmp_path / 'refused')
     assert refused.exit_code != 0
     assert 'adopted cache' in refused.output and '--regression-baseline' in refused.output
-    assert not any(i in p.read_text() for p in (tmp_path / 'refused').iterdir() for i in ids)
+    assert not any(i in p.read_text() for p in (tmp_path / 'refused').rglob('*') if p.is_file() for i in ids)
 
     out_dir = tmp_path / 'out'
     result = _run_all(tmp_data_dir, out_dir, '--regression-baseline')
     assert result.exit_code == 0, result.output + repr(result.exception)
-    run_manifest = json.loads((out_dir / manifest.RUN_MANIFEST_FILE).read_text())
+    run_manifest = json.loads((run_dir(out_dir) / manifest.RUN_MANIFEST_FILE).read_text())
     assert run_manifest['adopted_cache'] is True
     assert {t['provenance'] for t in run_manifest['tables'].values()} == {manifest.ADOPTED_UNVERIFIED}
-    html = next(out_dir.glob('report_*.html')).read_text()
+    html = next(run_dir(out_dir).glob('report_*.html')).read_text()
     assert 'ADOPTED CACHE: provenance unverified (regression run)' in html
     assert 'adopted_unverified' in html
 
@@ -116,9 +116,9 @@ def test_provenance_time_labels_never_shared(tmp_path: Path, tmp_data_dir: Path,
         extra = ['--regression-baseline']
     out_dir = tmp_path / 'out'
     assert _run_all(tmp_data_dir, out_dir, *extra).exit_code == 0
-    html = next(out_dir.glob('report_*.html')).read_text()
+    html = next(run_dir(out_dir).glob('report_*.html')).read_text()
     provenance = html[html.index('<details class="prov"') : html.index('</details>')]
-    run_manifest = json.loads((out_dir / manifest.RUN_MANIFEST_FILE).read_text())
+    run_manifest = json.loads((run_dir(out_dir) / manifest.RUN_MANIFEST_FILE).read_text())
     if adopted:
         assert 'file_mtime_utc (inferred)' in provenance and 'query_time_utc' not in provenance
     else:
@@ -134,8 +134,8 @@ def test_run_manifest_lists_outputs(tmp_path: Path, tmp_data_dir: Path) -> None:
     _seed(tmp_data_dir)
     out_dir = tmp_path / 'out'
     assert _run_all(tmp_data_dir, out_dir).exit_code == 0
-    run_manifest = json.loads((out_dir / manifest.RUN_MANIFEST_FILE).read_text())
-    assert set(run_manifest['outputs']) == {p.name for p in out_dir.iterdir()}
+    run_manifest = json.loads((run_dir(out_dir) / manifest.RUN_MANIFEST_FILE).read_text())
+    assert set(run_manifest['outputs']) == {p.name for p in run_dir(out_dir).iterdir()}
     assert set(run_manifest['tables']) == {'dist_s1', 'rtc_s1'}
 
 
@@ -144,9 +144,9 @@ def test_standalone_check_embeds_provenance(tmp_path: Path, tmp_data_dir: Path) 
     out_dir = tmp_path / 'out'
     args = ['check-duplicates', '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir)]
     assert CliRunner().invoke(cli, args).exit_code == 0
-    html = next(out_dir.glob('report_*.html')).read_text()
+    html = next(run_dir(out_dir).glob('report_*.html')).read_text()
     assert '<details class="prov"' in html and 'dist_s1 table' in html
-    assert json.loads((out_dir / 'run_status.json').read_text())['state'] == 'COMPLETE'
+    assert json.loads((run_dir(out_dir) / 'run_status.json').read_text())['state'] == 'COMPLETE'
 
 
 @pytest.mark.parametrize('command', ['run-all', 'check-ordering'])
@@ -158,7 +158,7 @@ def test_layer_completeness_disclaimer(tmp_path: Path, tmp_data_dir: Path, comma
     else:
         args = [command, '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir)]
         assert CliRunner().invoke(cli, args).exit_code == 0
-    html = next(out_dir.glob('report_*.html')).read_text()
+    html = next(run_dir(out_dir).glob('report_*.html')).read_text()
     provenance = html[html.index('<details class="prov"') : html.index('</details>')]
     assert 'Layer completeness (GEN-METRIC, GEN-DIST-STATUS-ACQ) is not checked.' in provenance
 

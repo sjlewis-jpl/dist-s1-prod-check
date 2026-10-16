@@ -1,4 +1,5 @@
 import hashlib
+import secrets
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -158,7 +159,9 @@ def _write_csvs(out_dir: Path, stamp: str, csvs: dict[str, pd.DataFrame]) -> lis
     names = []
     for name, df in csvs.items():
         path = out_dir / f'{name}_{stamp}.csv'
-        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(path, index=False)
+        tmp = path.with_suffix('.csv.tmp')  # renamed into place, so a reader never sees a half-written CSV (F34)
+        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(tmp, index=False)
+        tmp.replace(path)
         names.append(path.name)
     return names
 
@@ -187,23 +190,45 @@ def _write_report(
     return html_path
 
 
+LATEST_RUN_FILE = 'latest'
+
+
+def run_directory(out_dir: Path, stamp: str) -> Path:
+    """Create `out_dir/<stamp>_<6 hex>/` for one run and record its name in `out_dir/latest` (atomically)."""
+    run_dir = Path(out_dir) / f'{stamp}_{secrets.token_hex(3)}'
+    run_dir.mkdir(parents=True, exist_ok=False)
+    tmp = Path(out_dir) / f'.{LATEST_RUN_FILE}.{run_dir.name}.tmp'
+    tmp.write_text(run_dir.name + '\n')
+    tmp.replace(Path(out_dir) / LATEST_RUN_FILE)
+    return run_dir
+
+
+def latest_run_directory(out_dir: Path) -> Path:
+    """Directory of the newest run under `out_dir` (`out_dir` itself if no run directory is recorded)."""
+    latest = Path(out_dir) / LATEST_RUN_FILE
+    return Path(out_dir) / latest.read_text().strip() if latest.exists() else Path(out_dir)
+
+
 class _Run:
     """Track one command's run: `run_status.json`, CSVs and the HTML report, complete or partial.
 
-    Writes RUNNING on creation. Inside ``with run:`` each check is wrapped by `stage` and recorded by `add`;
-    `complete` writes the report and then COMPLETE as the very last step. Any exception leaving the block writes
-    INCOMPLETE, then a partial report with an INCOMPLETE banner, and propagates unchanged; an error while writing the
-    partial report is logged and never replaces the original exception.
+    Every run writes into its own directory `out_dir/<stamp>_<6 hex>/` (F34), and `out_dir/latest` names the most
+    recent one, so two runs never mix their outputs. Writes RUNNING on creation. Inside ``with run:`` each check is
+    wrapped by `stage` and recorded by `add`; `complete` writes the report and then COMPLETE as the very last step.
+    Any exception leaving the block writes INCOMPLETE, then a partial report with an INCOMPLETE banner, and propagates
+    unchanged; an error while writing the partial report is logged and never replaces the original exception.
     """
 
     def __init__(self, out_dir: Path, stamp: str, checks: list[str], title: str, regression_baseline: bool) -> None:
-        self.out_dir, self.stamp, self.checks, self.title = out_dir, stamp, checks, title
+        self.out_dir = run_directory(out_dir, stamp)
+        self.stamp, self.checks, self.title = stamp, checks, title
         self.manifest = _new_run_manifest(regression_baseline)
         self.subtitle = ''
         self.current = 'setup'
         self.done: list[str] = []
         self.sections: list[dict] = []
-        status.write_run_status(out_dir, status.RunState.RUNNING, checks_planned=checks, checks_done=[])
+        status.write_run_status(self.out_dir, status.RunState.RUNNING, checks_planned=checks, checks_done=[])
+        click.echo(f'Run directory: {self.out_dir}')
 
     def __enter__(self) -> '_Run':
         return self

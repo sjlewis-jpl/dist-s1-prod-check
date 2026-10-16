@@ -16,6 +16,7 @@ from click.testing import CliRunner
 
 from dist_s1_prod_check import report
 from dist_s1_prod_check.cli import cli
+from factories import run_dir
 
 
 TESTS_DATA = Path(__file__).parent / 'data'
@@ -102,7 +103,7 @@ def _install_network_blocks(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
 def _csv_rows(out_dir: Path) -> dict[str, int]:
     counts = {}
-    for path in sorted(out_dir.glob('*.csv')):
+    for path in sorted(run_dir(out_dir).glob('*.csv')):
         name = path.stem.rsplit('_', 1)[0]
         try:
             counts[name] = len(pd.read_csv(path))

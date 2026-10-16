@@ -57,3 +57,14 @@ def test_started_utc_survives_updates(tmp_path: Path) -> None:
 )
 def test_is_green(state: str, counts: dict, n_checked: int, green: bool) -> None:
     assert status.is_green(status.SectionState(state), counts, n_checked) is green
+
+
+# F34: runs shared one directory, so a crashed run's files and a later run's could be read together.
+def test_f34_each_run_gets_its_own_directory(tmp_path: Path) -> None:
+    from dist_s1_prod_check.cli import latest_run_directory, run_directory
+
+    first = run_directory(tmp_path, '20261016T000000')
+    second = run_directory(tmp_path, '20261016T000000')
+    assert first != second and first.parent == second.parent == tmp_path
+    assert latest_run_directory(tmp_path) == second
+    assert not list(tmp_path.glob('*.tmp')) and not list(tmp_path.glob('.*.tmp'))

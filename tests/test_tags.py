@@ -10,7 +10,7 @@ from rasterio.errors import RasterioIOError
 
 from dist_s1_prod_check import tags
 from dist_s1_prod_check.cli import cli
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, rtc_id, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, rtc_id, run_dir, seed_data_dir
 
 
 TILE = '10SGC'
@@ -82,7 +82,7 @@ def test_f14_latest_status_404_is_unknown_in_coverage(
     df_tags = pd.read_parquet(tmp_data_dir / 'dist_s1_tags.parquet').set_index('opera_id')
     assert '404' in df_tags.error[latest], 'fixture: the latest STATUS read should have failed'
 
-    (cov_csv,) = out_dir.glob('coverage_2*.csv')
+    (cov_csv,) = run_dir(out_dir).glob('coverage_2*.csv')
     df_cov = pd.read_csv(cov_csv, keep_default_na=False)
     row = df_cov[pd.to_datetime(df_cov.post_acq_dt).dt.day == ACQ_REPROCESSED.day].iloc[0].to_dict()
 

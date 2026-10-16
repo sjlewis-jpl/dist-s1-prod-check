@@ -13,7 +13,7 @@ from click.testing import CliRunner, Result
 from dist_s1_prod_check import inputs, network, tags
 from dist_s1_prod_check.cli import cli
 from dist_s1_prod_check.constants import RTC_S1_PARQUET
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, run_dir, seed_data_dir
 
 
 TILE = '10SGC'
@@ -58,9 +58,9 @@ def test_offline_run_all_completes_without_network(tmp_path: Path, tmp_data_dir:
     out_dir = tmp_path / 'out'
     result = _run_all(tmp_data_dir, out_dir)
     assert result.exit_code == 0, result.output + repr(result.exception)
-    assert json.loads((out_dir / 'run_status.json').read_text())['state'] == 'COMPLETE'
-    assert json.loads((out_dir / 'run_manifest.json').read_text())['offline'] is True
-    assert 'offline run' in next(out_dir.glob('report_*.html')).read_text()
+    assert json.loads((run_dir(out_dir) / 'run_status.json').read_text())['state'] == 'COMPLETE'
+    assert json.loads((run_dir(out_dir) / 'run_manifest.json').read_text())['offline'] is True
+    assert 'offline run' in next(run_dir(out_dir).glob('report_*.html')).read_text()
 
 
 def test_offline_missing_tag_row_names_the_step(tmp_path: Path, tmp_data_dir: Path) -> None:
@@ -68,7 +68,7 @@ def test_offline_missing_tag_row_names_the_step(tmp_path: Path, tmp_data_dir: Pa
     result = _run_all(tmp_data_dir, tmp_path / 'out')
     assert result.exit_code != 0
     assert '--offline is set but fetching tags for 1 products with no cached tag row' in result.output
-    status = json.loads((tmp_path / 'out' / 'run_status.json').read_text())
+    status = json.loads((run_dir(tmp_path / 'out') / 'run_status.json').read_text())
     assert (status['state'], status['failed_check']) == ('INCOMPLETE', 'tags')
     assert ids
 
@@ -94,7 +94,7 @@ def test_offline_tag_error_rows_kept_not_retried(tmp_path: Path, tmp_data_dir: P
     out_dir = tmp_path / 'out'
     result = _run_all(tmp_data_dir, out_dir)
     assert result.exit_code == 0, result.output + repr(result.exception)
-    df = pd.read_csv(next(out_dir.glob('inputs_[0-9]*.csv')))
+    df = pd.read_csv(next(run_dir(out_dir).glob('inputs_[0-9]*.csv')))
     row = df[df.opera_id == ids[0]].iloc[0]
     assert row.issue_type == 'Tag read error' and pd.isna(row.inputs_correct)
     assert row.issue_value == 'RasterioIOError: 404 (not retried: offline)'
