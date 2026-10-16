@@ -68,7 +68,6 @@ def _assert_incomplete_raised(items: list[dict] | None, error: Exception | None)
 
 
 # aa2014f: search_granules returned 0 rows instead of raising (missing `items` read as an empty last page)
-@pytest.mark.xfail(strict=True, reason='F15: a 200 response with no `items` key is read as an empty page')
 def test_f15_missing_items_key_raises_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _serve(monkeypatch, [FakeResponse({'hits': 10, 'took': 5}, headers={'CMR-Hits': '10'})])
 
@@ -79,7 +78,6 @@ def test_f15_missing_items_key_raises_incomplete(monkeypatch: pytest.MonkeyPatch
 
 
 # aa2014f: search_granules returned 2000 rows instead of raising (CMR-Hits 4000 never compared)
-@pytest.mark.xfail(strict=True, reason='F15: CMR-Hits is never compared with the rows received')
 def test_f15_hits_exceed_rows_without_search_after_raises_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
     page = {'hits': 4000, 'items': [{'meta': {'concept-id': f'G{i}-ASF'}} for i in range(CMR_PAGE_SIZE)]}
     calls = _serve(monkeypatch, [FakeResponse(page, headers={'CMR-Hits': '4000'})])
@@ -88,6 +86,30 @@ def test_f15_hits_exceed_rows_without_search_after_raises_incomplete(monkeypatch
 
     assert len(calls) == 1
     _assert_incomplete_raised(items, error)
+
+
+def test_f15_paged_search_returns_hits(monkeypatch: pytest.MonkeyPatch) -> None:
+    items = [{'meta': {'concept-id': f'G{i}-ASF'}} for i in range(CMR_PAGE_SIZE + 5)]
+    pages = [
+        FakeResponse({'items': items[:CMR_PAGE_SIZE]}, headers={'CMR-Hits': '2005', 'CMR-Search-After': 'k1'}),
+        FakeResponse({'items': items[CMR_PAGE_SIZE:]}, headers={'CMR-Hits': '2005', 'CMR-Search-After': 'k2'}),
+        FakeResponse({'items': []}, headers={'CMR-Hits': '2005'}),
+    ]
+    calls = _serve(monkeypatch, pages)
+
+    result, error = _search_outcome()
+
+    assert error is None and len(result) == 2005 and result.hits == 2005
+    assert calls[1]['headers']['CMR-Search-After'] == 'k1'
+
+
+def test_f15_unknown_hits_raises_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve(monkeypatch, [FakeResponse({'items': [{'meta': {}}]})])
+
+    items, error = _search_outcome()
+
+    _assert_incomplete_raised(items, error)
+    assert 'no hit count' in str(error)
 
 
 def _umm_item(opera_id: str) -> dict:

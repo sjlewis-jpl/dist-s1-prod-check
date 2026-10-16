@@ -60,11 +60,34 @@ def _fmt_dt(t: DateLike) -> str:
     return ts.strftime('%Y-%m-%dT%H:%M:%SZ')
 
 
+class IncompleteResultsError(RuntimeError):
+    """A CMR search did not return every granule it reported (or its completeness cannot be established)."""
+
+
+class GranuleList(list):
+    """Granules of one CMR search, with the `hits` CMR reported for it."""
+
+    hits: int | None = None
+
+
 @retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
-def _get_page(params: dict, headers: dict, cmr_url: str = CMR_GRANULES_URL) -> tuple[list[dict], str | None]:
+def _get_page(
+    params: dict, headers: dict, cmr_url: str = CMR_GRANULES_URL
+) -> tuple[list[dict], str | None, int | None]:
+    """One page of a CMR granule search: its items, the search-after token and the hits CMR reports.
+
+    Raises `IncompleteResultsError` when the response has no `items` list: a malformed or truncated response must
+    not read as an empty last page (F15).
+    """
     resp = requests.get(cmr_url, params=params, headers=headers, timeout=120)
     resp.raise_for_status()
-    return resp.json().get('items', []), resp.headers.get('CMR-Search-After')
+    payload = resp.json()
+    items = payload.get('items') if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        keys = sorted(payload) if isinstance(payload, dict) else type(payload).__name__
+        raise IncompleteResultsError(f'CMR response from {cmr_url} has no items list (got {keys})')
+    hits = resp.headers.get('CMR-Hits', payload.get('hits'))
+    return items, resp.headers.get('CMR-Search-After'), None if hits is None else int(hits)
 
 
 def search_granules(
@@ -77,7 +100,12 @@ def search_granules(
     parse_fn: Callable[[dict], dict] | None = None,
     cmr_url: str = CMR_GRANULES_URL,
 ) -> list[dict]:
-    """Search CMR granules; with `parse_fn`, each page is parsed as it arrives so raw UMM JSON is never accumulated."""
+    """Search CMR granules; with `parse_fn`, each page is parsed as it arrives so raw UMM JSON is never accumulated.
+
+    Returns a `GranuleList` whose `hits` is the count CMR reported. Raises `IncompleteResultsError` if CMR reported
+    no count, or if fewer granules arrived than it reported (F15). More is accepted: granules ingested while paging.
+    A hits match proves the query was paged to the end, not that the archive itself is complete.
+    """
     network_allowed('a CMR granule search (metadata download or chunk re-query)')
     params: dict = {
         'collection_concept_id': collection_concept_id,
@@ -91,14 +119,21 @@ def search_granules(
         params['options[readable_granule_name][pattern]'] = 'true'
 
     headers = {'Authorization': f'Bearer {token}'} if token else {}
-    items: list[dict] = []
+    items = GranuleList()
     search_after = None
     while True:
         page_headers = headers | ({'CMR-Search-After': search_after} if search_after else {})
-        page_items, search_after = _get_page(params, page_headers, cmr_url)
+        page_items, search_after, page_hits = _get_page(params, page_headers, cmr_url)
+        items.hits = page_hits if items.hits is None else items.hits
         items.extend(map(parse_fn, page_items) if parse_fn else page_items)
         if not page_items or search_after is None:
-            return items
+            break
+    window = f'{params["temporal"]} of {collection_concept_id}'
+    if items.hits is None:
+        raise IncompleteResultsError(f'CMR reported no hit count for {window}; completeness is unknown')
+    if len(items) < items.hits:
+        raise IncompleteResultsError(f'CMR returned {len(items)} of {items.hits} granules for {window}')
+    return items
 
 
 def _date_chunks(start_time: DateLike, stop_time: DateLike, chunk_days: int) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
