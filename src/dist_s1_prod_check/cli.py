@@ -7,7 +7,7 @@ import click
 import geopandas as gpd
 import pandas as pd
 
-from dist_s1_prod_check import checks, coverage, inputs, manifest, network, report, schema, status, tags
+from dist_s1_prod_check import checks, coverage, inputs, manifest, matching, network, report, schema, status, tags
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
     DIST_S1_S3_BUCKETS,
@@ -936,7 +936,6 @@ def _coverage_section(
     query_windows: list[manifest.QueryWindow] | None = None,
     df_tags: pd.DataFrame | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
-    from dist_s1_prod_check import matching
 
     df_groups = coverage.expected_pass_groups(df_frame, start, stop)
     # One assignment feeds both checks, so every product is either matched to a pass or an orphan (F06).

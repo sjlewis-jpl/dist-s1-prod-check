@@ -312,7 +312,6 @@ def test_f18_n_versions_from_unfiltered_table(
 
 # aa2014f: the coverage description only says passes "should have triggered a DIST-S1 product"; it never states
 # that every pass in the whole acquisition window is expected in a processing-window run
-@pytest.mark.xfail(strict=True, reason='F18: coverage text does not state the whole acquisition window is expected')
 def test_f18_coverage_text_states_whole_acquisition_window(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
