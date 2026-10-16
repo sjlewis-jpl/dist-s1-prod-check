@@ -279,3 +279,25 @@ def test_f13_map_includes_tile_beyond_truncation(big_report: tuple[dict, str]) -
 def test_f13_truncated_table_labelled_with_counts(big_report: tuple[dict, str]) -> None:
     _, html = big_report
     assert 'showing first 50,000 of 50,001' in html
+
+
+# --- Phase 4, task 0: the script must render with and without Leaflet ----------------------------------------------
+
+
+# c27b56b..4fcf2a8: esc() and isUrl() were defined inside `if (window.L) {...}`, so the stat-tile loop threw
+# "esc is not a function" before rendering anything, with or without Leaflet.
+@pytest.mark.parametrize('leaflet', [False, True])
+def test_report_script_renders_tiles_and_sections(tmp_path: Path, leaflet: bool) -> None:
+    from jsrender import render
+
+    df = pd.DataFrame({'opera_id': ['p0'], 'mgrs_tile_id': [TILE], 'reason': ['bad']})
+    section = report.build_section('one', 'One', 'One failure.', df, 1)
+    out = report.write_html_report([section], _tile_geoms([TILE]), tmp_path / 'r.html')
+    page = render(out, leaflet=leaflet)
+    assert page['error'] is None, page['error']
+    assert 'One' in page['elements']['tiles']['innerHTML']
+    assert len(page['sections']) == 1 and 'One failure.' in page['sections'][0]
+    if leaflet:
+        assert ['geoJSON', 1] in page['mapCalls']
+    else:
+        assert 'Map unavailable' in page['elements']['map']['innerHTML']

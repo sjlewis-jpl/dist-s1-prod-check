@@ -361,6 +361,12 @@ document.getElementById('title').textContent = DATA.title;
 document.getElementById('subtitle').textContent = DATA.subtitle;
 
 const RS = DATA.run_status;
+// Helpers are defined at top level: a function declared inside the Leaflet guard is not defined before that block
+// runs, which broke the whole page (stat tiles first) with or without Leaflet.
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function isUrl(v) { return typeof v === 'string' && v.startsWith('https://'); }
 
 
 const tilesDiv = document.getElementById('tiles');
@@ -492,11 +498,6 @@ if (window.L) {
     'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_' + (dark ? 'Dark' : 'Light') + '_Gray_Base/MapServer/tile/{z}/{y}/{x}',
     {attribution: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ', maxZoom: 16}
   ).addTo(map);
-
-  function esc(s) {
-    return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-  }
-  function isUrl(v) { return typeof v === 'string' && v.startsWith('https://'); }
 
   const overlays = {};
   let allBounds = null;
