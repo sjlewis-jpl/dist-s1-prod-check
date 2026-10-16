@@ -186,6 +186,16 @@ def provenance_rows(prov: dict) -> list[tuple[str, str]]:
     if pf:
         rows.append(('Processing filter', f'processed {pf.get("start") or "start"} to {pf.get("stop") or "now"}; '
                      f'kept {pf.get("n_kept", 0):,} of {pf.get("n_before", 0):,} products'))  # fmt: skip
+    wf = prov.get('window_filter') or {}
+    if wf:
+        n_out = wf.get('n_before', 0) - wf.get('n_kept', 0)
+        rows.append(('Acquisition window', f'[{wf["start"]}, {wf["stop"]}): kept {wf.get("n_kept", 0):,} of '
+                     f'{wf.get("n_before", 0):,} cached products; {n_out:,} outside the acquisition window '
+                     'excluded (kept in the cache as context)'))  # fmt: skip
+    drops = prov.get('rtc_frame_drops') or {}
+    if drops:
+        detail = ', '.join(f'{k.replace("_", " ")} {v:,}' for k, v in drops.items())
+        rows.append(('RTC-S1 rows dropped', f'building the enumerator input frame: {detail}'))
     for key, smp in (prov.get('sampling') or {}).items():
         rows.append(
             (

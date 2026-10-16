@@ -430,15 +430,31 @@ def get_rtc_s1_table_with_lookback(
 
 
 def build_rtc_input_frame(df_rtc: gpd.GeoDataFrame, mgrs_tile_ids: list[str] | None = None) -> gpd.GeoDataFrame:
+    """Shape an RTC-S1 metadata table into the enumerator's rtc_s1_schema; see `build_rtc_input_frame_with_drops`."""
+    return build_rtc_input_frame_with_drops(df_rtc, mgrs_tile_ids)[0]
+
+
+RTC_DROP_REASONS = ('single_polarization', 'null_geometry', 'not_in_lut')
+
+
+def build_rtc_input_frame_with_drops(
+    df_rtc: gpd.GeoDataFrame, mgrs_tile_ids: list[str] | None = None
+) -> tuple[gpd.GeoDataFrame, dict[str, int]]:
     """Shape an RTC-S1 metadata table into the enumerator's rtc_s1_schema (LUT join adds one row per MGRS tile).
 
-    Single-polarization granules are dropped here: DIST-S1 never uses them, as a post-image or in a baseline.
+    Returns the frame and the number of RTC-S1 rows dropped per reason (F30), in this order of precedence:
+
+    - ``single_polarization``: DIST-S1 never uses them, as a post-image or in a baseline.
+    - ``null_geometry``: the burst has no footprint in the burst table.
+    - ``not_in_lut``: the burst feeds none of `mgrs_tile_ids` in the MGRS-burst LUT (with an AOI, e.g. bursts of
+      the widened RTC-S1 bbox that only touch neighbouring tiles).
     """
     dual_pol = df_rtc.polarizations.isin(DUAL_POLARIZATIONS)
     n_dropped = int((~dual_pol).sum())
     if n_dropped:
         warn(f'Dropping {n_dropped} RTC-S1 granules that are not dual polarization ({", ".join(DUAL_POLARIZATIONS)}).')
-    df = df_rtc[dual_pol & df_rtc.geometry.notna()].copy()
+    has_geom = df_rtc.geometry.notna()
+    df = df_rtc[dual_pol & has_geom].copy()
     df['acq_dt'] = pd.to_datetime(df.acq_dt, utc=True)
     df['pass_id'] = df.acq_dt.map(extract_pass_id)
     df['url_copol'] = df.url_copol.fillna('')
@@ -446,5 +462,11 @@ def build_rtc_input_frame(df_rtc: gpd.GeoDataFrame, mgrs_tile_ids: list[str] | N
     if mgrs_tile_ids is None:
         lut = get_mgrs_burst_lut()
         mgrs_tile_ids = sorted(lut[lut.jpl_burst_id.isin(df.jpl_burst_id.unique())].mgrs_tile_id.unique())
+    n_in = df.opera_id.nunique()
     df = append_pass_data(df, mgrs_tile_ids)
-    return gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+    drops = {
+        'single_polarization': n_dropped,
+        'null_geometry': int((dual_pol & ~has_geom).sum()),
+        'not_in_lut': n_in - int(df.opera_id.nunique()),
+    }
+    return gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326'), drops

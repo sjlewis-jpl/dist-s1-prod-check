@@ -305,6 +305,8 @@ class RunManifest:
     sampling: dict[str, dict] = field(default_factory=dict)
     version_filter: dict = field(default_factory=dict)
     processing_filter: dict = field(default_factory=dict)
+    window_filter: dict = field(default_factory=dict)
+    rtc_frame_drops: dict = field(default_factory=dict)
     offline: bool = False
     regression_baseline: bool = False
     outputs: list[str] = field(default_factory=list)

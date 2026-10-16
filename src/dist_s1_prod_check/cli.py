@@ -7,7 +7,7 @@ import click
 import geopandas as gpd
 import pandas as pd
 
-from dist_s1_prod_check import checks, coverage, inputs, manifest, network, report, status, tags
+from dist_s1_prod_check import checks, coverage, inputs, manifest, network, report, schema, status, tags
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
     DIST_S1_S3_BUCKETS,
@@ -30,7 +30,10 @@ def _load_dist(data_dir: Path) -> gpd.GeoDataFrame:
     path = data_dir / DIST_S1_PARQUET
     if not path.exists():
         raise click.ClickException(f'{path} not found; run `dist-s1-prod-check download-metadata` first.')
-    return gpd.read_parquet(path)
+    return schema.validate(gpd.read_parquet(path), schema.DIST_SCHEMA, path)
+
+
+SCHEMAS = {DIST_S1_PARQUET: schema.DIST_SCHEMA, RTC_S1_PARQUET: schema.RTC_SCHEMA}
 
 
 def _venue_of(data_dir: Path) -> str | None:
@@ -63,7 +66,7 @@ def _load_cached(
     m = manifest.load_table_manifest(path)
     manifest.require_compatible(m, request, path=path, regression_baseline=run.manifest.regression_baseline)
     run.manifest.tables[m.table] = m.to_dict()
-    return gpd.read_parquet(path), m
+    return schema.validate(gpd.read_parquet(path), SCHEMAS[filename], path), m
 
 
 def _filter_versions(df_dist: gpd.GeoDataFrame, product_versions: str, run: '_Run | None') -> gpd.GeoDataFrame:
@@ -140,10 +143,14 @@ def _load_target_tiles(data_dir: Path) -> list[str] | None:
     return tiles_path.read_text().split()
 
 
-def _build_rtc_frame(df_rtc: gpd.GeoDataFrame, data_dir: Path) -> gpd.GeoDataFrame:
-    from dist_s1_prod_check.cmr import build_rtc_input_frame
+def _build_rtc_frame(df_rtc: gpd.GeoDataFrame, run: '_Run', mgrs_tile_ids: list[str] | None) -> gpd.GeoDataFrame:
+    """Build the enumerator input frame for `mgrs_tile_ids`; count the RTC-S1 rows it drops in the run manifest."""
+    from dist_s1_prod_check.cmr import build_rtc_input_frame_with_drops
 
-    return build_rtc_input_frame(df_rtc, mgrs_tile_ids=_load_target_tiles(data_dir))
+    df_frame, drops = build_rtc_input_frame_with_drops(df_rtc, mgrs_tile_ids=mgrs_tile_ids)
+    run.manifest.rtc_frame_drops = drops
+    click.echo('RTC-S1 rows dropped building the input frame: ' + ', '.join(f'{k} {v}' for k, v in drops.items()))
+    return df_frame
 
 
 def _write_csvs(out_dir: Path, stamp: str, csvs: dict[str, pd.DataFrame]) -> list[str]:
@@ -959,7 +966,11 @@ def check_inputs(
             df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
             run.manifest.sampling['inputs'] = _sampling_record(n_universe, df_tags.opera_id, seed, 'products')
             state = SectionState.SAMPLED
-        df_frame = _build_rtc_frame(_load_rtc_checked(data_dir, run)[0], data_dir) if mode == 'offline' else None
+        df_frame = (
+            _build_rtc_frame(_load_rtc_checked(data_dir, run)[0], run, _load_target_tiles(data_dir))
+            if mode == 'offline'
+            else None
+        )
         return _inputs_section(
             df_tags,
             df_frame,
@@ -981,7 +992,7 @@ def _check_coverage_standalone(
     df_rtc, m_rtc = _load_rtc_checked(data_dir, run, start, stop)
     return _coverage_section(
         df_dedup,
-        _build_rtc_frame(df_rtc, data_dir),
+        _build_rtc_frame(df_rtc, run, _load_target_tiles(data_dir)),
         start,
         stop,
         _wkt_by_tile(_all_tile_geoms()),
@@ -1105,11 +1116,18 @@ def run_all(
         request = manifest.CacheRequest(venue, start, stop, bbox, check_bbox=True)
         df_dist, m_dist = _load_cached(data_dir, DIST_S1_PARQUET, run, request)
         df_dist = _filter_versions(df_dist, product_versions, run)
-        if manifest.strictly_inside(m_dist, start, stop):
-            acq = pd.to_datetime(df_dist.acq_time, utc=True)
-            in_window = (acq >= manifest._utc(start)) & (acq < manifest._utc(stop))
-            click.echo(f'Window filter kept {int(in_window.sum())} of {len(df_dist)} cached DIST-S1 products')
-            df_dist = df_dist[in_window].reset_index(drop=True)
+        # Always apply the exact [start, stop) acquisition filter (F31): CMR matches temporal extents inclusively
+        # and a cache may span a wider window. Rows outside it stay in the cache as context and are counted.
+        acq = pd.to_datetime(df_dist.acq_time, utc=True)
+        in_window = (acq >= manifest._utc(start)) & (acq < manifest._utc(stop))
+        click.echo(f'Window filter kept {int(in_window.sum())} of {len(df_dist)} cached DIST-S1 products')
+        run.manifest.window_filter = {
+            'start': start,
+            'stop': stop,
+            'n_before': len(df_dist),
+            'n_kept': int(in_window.sum()),
+        }
+        df_dist = df_dist[in_window].reset_index(drop=True)
         if processing_start or processing_stop:
             n_before = len(df_dist)
             df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
@@ -1132,10 +1150,8 @@ def run_all(
             data_dir, RTC_S1_PARQUET, run, manifest.CacheRequest('PROD', start, stop, bbox, check_bbox=True)
         )
         click.echo(f'RTC-S1 granules: {len(df_rtc)}')
-        from dist_s1_prod_check.cmr import build_rtc_input_frame
-
         frame_tiles = sorted(keep) if sample_tiles else _load_target_tiles(data_dir)
-        df_frame = build_rtc_input_frame(df_rtc, mgrs_tile_ids=frame_tiles)
+        df_frame = _build_rtc_frame(df_rtc, run, frame_tiles)
 
         df_dedup = checks.deduplicate_products(df_dist)
         # Sampling selects the products whose tags are fetched (the expensive step), so it applies to both the

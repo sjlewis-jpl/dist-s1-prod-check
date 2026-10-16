@@ -413,3 +413,74 @@ def test_f28_adopt_cache_writes_missing_venue_file(tmp_data_dir: Path, cli_runne
     result = _invoke(cli_runner, 'adopt-cache', '--venue', 'UAT', *JANUARY, '--data-dir', str(tmp_data_dir))
     assert result.exit_code == 0, result.output + repr(result.exception)
     assert (tmp_data_dir / 'venue.txt').read_text().strip() == 'UAT'
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# F31: no exact [start, stop) acquisition filter on the cached DIST table; F35: no schema validation on load.
+
+
+# c27b56b: a cached product acquired before --start (CMR matches temporal extents inclusively) was checked, because
+# the window filter only ran when the request was strictly inside the cached window.
+def test_f31_dist_outside_window_excluded_and_counted(
+    tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner
+) -> None:
+    dist, rtc, tag_df = _world()
+    early = dist_id(TILE, '2025-12-31T23:59:00', '2026-01-01T06:00:00')
+    dist_all = make_dist([*({'opera_id': o} for o in dist.opera_id), {'opera_id': early}])
+    seed_data_dir(tmp_data_dir, dist_all, rtc, tag_df, target_tiles=[TILE], window=('2026-01-01', '2026-02-01'))
+    out_dir = tmp_path / 'out'
+    result = _run_all(cli_runner, tmp_data_dir, out_dir)
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert early not in _all_output_text(out_dir)
+    run_manifest = json.loads((out_dir / 'run_manifest.json').read_text())
+    assert run_manifest['window_filter'] == {'start': '2026-01-01', 'stop': '2026-02-01', 'n_before': 4, 'n_kept': 3}
+    html, _ = _report(out_dir)
+    assert 'outside the acquisition window' in html
+
+
+@pytest.mark.parametrize(
+    ('corrupt', 'expected'),
+    [
+        ('nat_processing_time', 'processing_time: not_nullable'),
+        ('duplicate_opera_id', 'opera_id: field_uniqueness'),
+        ('string_acq_time', 'acq_time: dtype is not a tz-naive datetime'),
+    ],
+)
+def test_f35_corrupt_dist_cache_refused(
+    corrupt: str, expected: str, tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner
+) -> None:
+    dist, rtc, tag_df = _world()
+    if corrupt == 'nat_processing_time':
+        dist.loc[1, 'processing_time'] = pd.NaT
+    elif corrupt == 'duplicate_opera_id':
+        dist = pd.concat([dist, dist.iloc[[0]]], ignore_index=True)
+    else:
+        dist['acq_time'] = dist.acq_time.astype(str)
+    seed_data_dir(tmp_data_dir, dist, rtc, tag_df, target_tiles=[TILE])
+    for args in (['check-ordering'], ['run-all', *JANUARY, '--inputs-workers', '1']):
+        result = _invoke(cli_runner, *args, '--data-dir', str(tmp_data_dir), '--out-dir', str(tmp_path / 'out'))
+        assert result.exit_code != 0, f'{args[0]} accepted a corrupt cache'
+        assert 'schema validation' in result.output and expected in result.output, result.output
+
+
+def test_f30_rtc_frame_drops_recorded(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    dist, rtc, tag_df = _world()
+    group = _group_bursts()
+    foreign = bursts_for_tile('33UUP').jpl_burst_id.iloc[0]  # feeds no tile of the target list
+    extra = make_rtc(
+        [
+            {'burst': group[0], 'acq': '2026-01-20T02:06:53', 'proc': '2026-01-20T07:00:00', 'polarizations': 'VV'},
+            {'burst': group[1], 'acq': '2026-01-20T02:06:54', 'proc': '2026-01-20T07:00:00'},
+            {'burst': foreign, 'acq': '2026-01-20T05:00:00', 'proc': '2026-01-20T07:00:00'},
+        ]
+    )
+    extra.loc[extra.jpl_burst_id == group[1], 'geometry'] = None
+    rtc_all = gpd.GeoDataFrame(pd.concat([rtc, extra], ignore_index=True), crs=rtc.crs)
+    seed_data_dir(tmp_data_dir, dist, rtc_all, tag_df, target_tiles=[TILE])
+    out_dir = tmp_path / 'out'
+    result = _run_all(cli_runner, tmp_data_dir, out_dir)
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    drops = json.loads((out_dir / 'run_manifest.json').read_text())['rtc_frame_drops']
+    assert drops == {'single_polarization': 1, 'null_geometry': 1, 'not_in_lut': 1}
+    html, _ = _report(out_dir)
+    assert 'RTC-S1 rows dropped' in html and 'single polarization 1' in html
