@@ -205,7 +205,6 @@ def test_f06c_optimal_assignment_beats_greedy() -> None:
 
 # aa2014f: today's per-direction checks already give MISSING + orphan here; the test fails with
 # ModuleNotFoundError: No module named 'dist_s1_prod_check.matching' (shared assignment, Phase 2)
-@pytest.mark.xfail(strict=True, reason='F06: no shared assignment; unmatched passes and products must come from one')
 def test_f06d_no_candidate_within_tolerance() -> None:
     far = T0 + pd.Timedelta(hours=2)
     frame, groups = _passes((0, T0))
