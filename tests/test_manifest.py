@@ -147,3 +147,17 @@ def test_standalone_check_embeds_provenance(tmp_path: Path, tmp_data_dir: Path) 
     html = next(out_dir.glob('report_*.html')).read_text()
     assert '<details class="prov"' in html and 'dist_s1 table' in html
     assert json.loads((out_dir / 'run_status.json').read_text())['state'] == 'COMPLETE'
+
+
+@pytest.mark.parametrize('command', ['run-all', 'check-ordering'])
+def test_layer_completeness_disclaimer(tmp_path: Path, tmp_data_dir: Path, command: str) -> None:
+    _seed(tmp_data_dir)
+    out_dir = tmp_path / 'out'
+    if command == 'run-all':
+        assert _run_all(tmp_data_dir, out_dir).exit_code == 0
+    else:
+        args = [command, '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir)]
+        assert CliRunner().invoke(cli, args).exit_code == 0
+    html = next(out_dir.glob('report_*.html')).read_text()
+    provenance = html[html.index('<details class="prov"') : html.index('</details>')]
+    assert 'Layer completeness (GEN-METRIC, GEN-DIST-STATUS-ACQ) is not checked.' in provenance
