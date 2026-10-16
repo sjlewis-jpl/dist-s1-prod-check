@@ -24,7 +24,7 @@
       "coverage_missing_by_tile": 2,
       "coverage_orphans": 0,
       "duplicates": 25,
-      "inputs": 636,
+      "inputs": 801,
       "inputs_failures": 54,
       "inputs_failures_post": 6,
       "inputs_failures_pre": 42,
@@ -40,7 +40,7 @@
         "n_failures": 3
       },
       "coverage": {
-        "n_checked": 671,
+        "n_checked": 660,
         "n_failures": 42
       },
       "duplicates": {
@@ -114,7 +114,7 @@
         "n_failures": 563
       },
       "coverage": {
-        "n_checked": 669,
+        "n_checked": 658,
         "n_failures": 80
       },
       "duplicates": {

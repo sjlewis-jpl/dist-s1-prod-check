@@ -857,11 +857,15 @@ def _inputs_section(
         report.build_section(
             'inputs',
             'Product inputs',
-            'Products whose recorded pre/post RTC-S1 inputs differ from the re-enumerated expected inputs.',
+            'Products whose recorded pre/post RTC-S1 inputs differ from the re-enumerated expected inputs. The '
+            'expected product is chosen from the product id (tile, acquisition), and tags that disagree are an '
+            'identity mismatch.',
             df_bad,
             n_checked,
             summary=_issue_summary(df_bad),
             counts=counts,
+            note=f'{int((df_results.status == Status.INFO).sum())} INFO notes (RTC processing version differs), '
+            'which never fail a product (inputs CSV)',
             **common,
         ),
         report.build_section(
@@ -913,15 +917,19 @@ def _require_one_row_per_product(df: pd.DataFrame, universe: pd.Series, check: s
 
 
 def _row_status(df_results: pd.DataFrame) -> pd.Series:
-    """Status of each inputs result row: PASS, FAIL, or UNKNOWN when the row could not be checked."""
-    return df_results.inputs_correct.map({True: Status.PASS, False: Status.FAIL}).fillna(Status.UNKNOWN).astype(str)
+    """Status of each inputs result row: its `status` (PASS, FAIL, UNKNOWN, INFO), else from `inputs_correct`."""
+    derived = df_results.inputs_correct.map({True: Status.PASS, False: Status.FAIL}).fillna(Status.UNKNOWN)
+    if 'status' in df_results.columns:
+        derived = df_results.status.where(df_results.status.notna() & (df_results.status != ''), derived)
+    return derived.astype(str)
 
 
 def _inputs_product_status(df_results: pd.DataFrame) -> pd.Series:
     """One status per product: UNKNOWN if any row could not be checked, else FAIL if any row failed, else PASS."""
     if df_results.empty:
         return pd.Series(dtype=str)
-    value = _row_status(df_results)
+    # INFO notes (e.g. RTC processing version differs) never decide a product's status (decision 4).
+    value = _row_status(df_results).replace({Status.INFO: Status.PASS})
     rank = value.map({Status.UNKNOWN: 0, Status.FAIL: 1, Status.PASS: 2})
     return value.groupby(df_results.opera_id).agg(lambda v: v.loc[rank[v.index].idxmin()])
 

@@ -282,7 +282,6 @@ def check_confirmation(
     df = df.sort_values(['mgrs_tile_id', 'acq_time'])
 
     df['tag_missing'] = df.error.isna() | (df.error != '') | df.prior_dist_s1_product.isna()
-    df['tile_incomplete'] = df.groupby('mgrs_tile_id')['tag_missing'].transform('any')
     df['prior_used'] = df.prior_dist_s1_product.fillna('').map(lambda p: p.split('/')[-1] or 'None')
     df['is_first_in_window'] = ~df.opera_dedup_id.isin(prev_acq.keys())
 
@@ -327,7 +326,6 @@ def check_confirmation(
         'prior_expected',
         'is_first_in_window',
         'tag_missing',
-        'tile_incomplete',
         'confirmed_ok',
         'status',
         'reason',
