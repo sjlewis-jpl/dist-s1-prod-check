@@ -16,9 +16,16 @@ from dist_s1_prod_check.constants import (
     DELTA_WINDOW_DAYS,
     DUAL_POLARIZATIONS,
     MAX_PRE_IMGS_PER_BURST,
+    PASS_MATCH_TOLERANCE_SECONDS,
     POST_DATE_BUFFER_SECONDS,
 )
-from dist_s1_prod_check.ids import get_acq_timestamp, get_burst_id, get_opera_id_trunc, get_track_number
+from dist_s1_prod_check.ids import (
+    get_acq_timestamp,
+    get_burst_id,
+    get_mgrs_tile_id,
+    get_opera_id_trunc,
+    get_track_number,
+)
 from dist_s1_prod_check.network import OfflineError, network_allowed
 from dist_s1_prod_check.tags import MISSING_TAG_URL, TAG_COLUMNS
 
@@ -93,7 +100,7 @@ def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str
     df_single = df[~df.polarizations.isin(DUAL_POLARIZATIONS)]
     if not df_single.empty:
         detail = ';'.join(f'{r.opera_id_trunc}={r.polarizations}' for r in df_single.itertuples())
-        issues.append({'issue_type': 'Single polarization input used', 'issue_value': detail})
+        issues.append(_issue('Single polarization input used', detail))
 
     df_post = df[df.input_category == 'post']
     post_pol_by_burst = dict(zip(df_post.jpl_burst_id, df_post.polarizations))
@@ -105,7 +112,7 @@ def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str
     ]
     if mismatched:
         detail = ';'.join(f'{opera_id}={pol} vs post-image {post_pol}' for opera_id, pol, post_pol in mismatched)
-        issues.append({'issue_type': 'Pre RTC baseline polarization mismatch', 'issue_value': detail})
+        issues.append(_issue('Pre RTC baseline polarization mismatch', detail))
     return issues
 
 
@@ -120,13 +127,13 @@ def compare_inputs(
 
     track_numbers = sorted(df_actual.track_number.unique().tolist())
     if not _tracks_adjacent(track_numbers):
-        issues.append({'issue_type': 'Too many track numbers present', 'issue_value': str(track_numbers)})
+        issues.append(_issue('Too many track numbers present', str(track_numbers)))
 
     df_post = df_actual[df_actual.input_category == 'post']
     df_pre = df_actual[df_actual.input_category == 'pre']
     post_span = df_post.acq_dt.max() - df_post.acq_dt.min()
     if post_span.days > 1:
-        issues.append({'issue_type': 'Post-dates span too long', 'issue_value': str(post_span)})
+        issues.append(_issue('Post-dates span too long', str(post_span)))
 
     exp_post = df_expected_product[df_expected_product.input_category == 'post']
     exp_pre = df_expected_product[df_expected_product.input_category == 'pre']
@@ -134,12 +141,7 @@ def compare_inputs(
     bursts_expected = sorted(df_expected_product.jpl_burst_id.unique())
     bursts_actual = sorted(df_actual.jpl_burst_id.unique())
     if bursts_expected != bursts_actual:
-        issues.append(
-            {
-                'issue_type': 'Burst ID mismatch',
-                'issue_value': f'expected={bursts_expected}; found={bursts_actual}',
-            }
-        )
+        issues.append(_issue('Burst ID mismatch', f'expected={bursts_expected}; found={bursts_actual}'))
 
     comparisons = [
         ('Pre RTC IDs expected but not found', exp_pre, df_pre),
@@ -150,7 +152,7 @@ def compare_inputs(
     for issue_type, df_left, df_right in comparisons:
         diff = sorted(set(df_left.opera_id_trunc) - set(df_right.opera_id_trunc))
         if diff:
-            issues.append({'issue_type': issue_type, 'issue_value': ';'.join(diff)})
+            issues.append(_issue(issue_type, ';'.join(diff)))
 
     return issues
 
@@ -165,48 +167,93 @@ def _expected_product_index(df_expected: pd.DataFrame) -> dict[str, pd.DataFrame
     return {tile: group for tile, group in idx.groupby('mgrs_tile_id')}
 
 
-def _match_expected_product_id(
-    index_by_tile: dict[str, pd.DataFrame], mgrs_tile_id: str, track_numbers: list[int], post_min_dt: pd.Timestamp
-) -> int | None:
-    candidates = index_by_tile.get(mgrs_tile_id)
+def own_tile(opera_id: str) -> str:
+    """MGRS tile of a DIST-S1 product from its own opera_id, or '' if the id cannot be parsed."""
+    try:
+        return get_mgrs_tile_id(opera_id)
+    except (IndexError, AttributeError, TypeError):
+        return ''
+
+
+def _match_expected_product(
+    candidates: pd.DataFrame | None, acq: pd.Timestamp, track_numbers: list[int]
+) -> tuple[int, float] | None:
+    """Choose the expected product of a DIST-S1 product from its own tile and acquisition time (F05).
+
+    Candidates are the tile's expected products whose earliest post acquisition is within
+    `POST_DATE_BUFFER_SECONDS` of the product's opera_id acquisition time. If several qualify, those sharing a
+    track with the tagged post inputs are preferred (the only use of the tags here); among the rest the closest in
+    time wins (ties: smaller product_id). Returns the product_id and its time difference in seconds, or None.
+    """
     if candidates is None:
         return None
-    time_ok = (candidates.post_min_dt - post_min_dt).abs().dt.total_seconds() < POST_DATE_BUFFER_SECONDS
-    track_ok = candidates.track_numbers.map(lambda tracks: bool(set(tracks) & set(track_numbers)))
-    matches = candidates[time_ok & track_ok]
-    if len(matches) != 1:
+    offset = (candidates.post_min_dt - acq).abs().dt.total_seconds()
+    matches = candidates.assign(offset_s=offset)[offset < POST_DATE_BUFFER_SECONDS]
+    if len(matches) > 1:
+        on_track = matches[matches.track_numbers.map(lambda tracks: bool(set(tracks) & set(track_numbers)))]
+        if not on_track.empty:
+            matches = on_track
+    if matches.empty:
         return None
-    return int(matches.product_id.iloc[0])
+    best = matches.sort_values(['offset_s', 'product_id']).iloc[0]
+    return int(best.product_id), float(best.offset_s)
+
+
+def _identity_issues(tag_tile: str, tile: str, acq: pd.Timestamp, df_actual: pd.DataFrame) -> list[dict]:
+    """FAIL `Identity mismatch` if the tags describe another tile or acquisition than the product's opera_id (F05)."""
+    disagreements = []
+    if tag_tile != tile:
+        disagreements.append(f'tag mgrs_tile_id={tag_tile} vs opera_id tile={tile}')
+    post_min = df_actual[df_actual.input_category == 'post'].acq_dt.min()
+    if pd.notna(post_min) and abs((post_min - acq).total_seconds()) > PASS_MATCH_TOLERANCE_SECONDS:
+        disagreements.append(f'earliest post input acq={post_min} vs opera_id acq={acq}')
+    return [_issue('Identity mismatch', '; '.join(disagreements))] if disagreements else []
 
 
 def _check_products_against_expected(
     df_tags_tile: pd.DataFrame, df_expected: pd.DataFrame, pol_by_opera_id: dict[str, str] | None = None
 ) -> list[dict]:
+    """Check one tile's products against the tile's expected products and return their result records.
+
+    Each product's expected product comes from its own opera_id (tile and acquisition time), and its tags must agree
+    with that identity (F05). Matching is one-to-one: if several products claim one expected product, the closest
+    in acquisition time wins (ties: smaller opera_id) and the others FAIL `Expected product already claimed`
+    without an input comparison.
+    """
     index_by_tile = _expected_product_index(df_expected)
     expected_by_product = dict(tuple(df_expected.groupby('product_id')))
 
-    records = []
+    pending = {}  # opera_id -> (base, issues, df_actual, product_id)
+    claims: dict[int, list[tuple[float, str]]] = {}
+    records_by_product: dict[str, list[dict]] = {}
     for row in df_tags_tile.itertuples():
-        base = {'opera_id': row.opera_id, 'mgrs_tile_id': row.mgrs_tile_id}
+        tile = own_tile(row.opera_id)
+        acq = get_acq_timestamp(row.opera_id)
+        base = {'opera_id': row.opera_id, 'mgrs_tile_id': tile}
         df_actual = parse_actual_inputs(row.pre_rtc_opera_ids, row.post_rtc_opera_ids)
-        track_numbers = sorted(df_actual.track_number.unique().tolist())
-        post_min_dt = df_actual[df_actual.input_category == 'post'].acq_dt.min()
-        product_id = _match_expected_product_id(index_by_tile, row.mgrs_tile_id, track_numbers, post_min_dt)
-        if product_id is None:
-            records.append(
-                {
-                    **base,
-                    'inputs_correct': False,
-                    'issue_type': 'No expected product found',
-                    'issue_value': f'tile={row.mgrs_tile_id}; tracks={track_numbers}; post={post_min_dt}',
-                }
-            )
+        issues = _identity_issues(row.mgrs_tile_id, tile, acq, df_actual)
+        post_tracks = sorted(df_actual[df_actual.input_category == 'post'].track_number.unique().tolist())
+        match = _match_expected_product(index_by_tile.get(tile), acq, post_tracks)
+        if match is None:
+            no_match = _issue('No expected product found', f'tile={tile}; acq={acq}; post tracks={post_tracks}')
+            records_by_product[row.opera_id] = _product_records(base, [*issues, no_match])
             continue
-        issues = compare_inputs(df_actual, expected_by_product[product_id], pol_by_opera_id=pol_by_opera_id)
-        if not issues:
-            records.append({**base, 'inputs_correct': True, 'issue_type': '', 'issue_value': ''})
-        records.extend({**base, 'inputs_correct': False, **issue} for issue in issues)
-    return records
+        product_id, dt = match
+        pending[row.opera_id] = (base, issues, df_actual, product_id)
+        claims.setdefault(product_id, []).append((dt, row.opera_id))
+
+    winner_by_product = {product_id: min(claimants)[1] for product_id, claimants in claims.items()}
+    for opera_id, (base, issues, df_actual, product_id) in pending.items():
+        winner = winner_by_product[product_id]
+        if winner != opera_id:
+            issues = [*issues, _issue('Expected product already claimed', f'claimed by {winner}')]
+        else:
+            issues = [
+                *issues,
+                *compare_inputs(df_actual, expected_by_product[product_id], pol_by_opera_id=pol_by_opera_id),
+            ]
+        records_by_product[opera_id] = _product_records(base, issues)
+    return [record for row in df_tags_tile.itertuples() for record in records_by_product[row.opera_id]]
 
 
 def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.GeoDataFrame) -> list[dict]:
@@ -221,18 +268,40 @@ def _check_one_tile(tile: str, df_tags_tile: pd.DataFrame, df_tile_frame: gpd.Ge
         return _check_products_against_expected(df_tags_tile, df_expected, pol_by_opera_id=pol_by_opera_id)
     except Exception as e:
         return [
-            {
-                'opera_id': row.opera_id,
-                'mgrs_tile_id': tile,
-                'inputs_correct': None,
-                'issue_type': 'Enumeration error',
-                'issue_value': f'{type(e).__name__}: {e}',
-            }
+            _record({'opera_id': row.opera_id, 'mgrs_tile_id': tile}, 'UNKNOWN', 'Enumeration error', _error_text(e))
             for row in df_tags_tile.itertuples()
         ]
 
 
-RESULT_COLUMNS = ['opera_id', 'mgrs_tile_id', 'inputs_correct', 'issue_type', 'issue_value']
+RESULT_COLUMNS = ['opera_id', 'mgrs_tile_id', 'inputs_correct', 'issue_type', 'issue_value', 'status']
+# A result row's status and the legacy `inputs_correct` it implies: INFO notes never fail a product.
+INPUTS_CORRECT_BY_STATUS = {'PASS': True, 'INFO': True, 'FAIL': False, 'UNKNOWN': None}
+
+
+def _error_text(e: Exception) -> str:
+    return f'{type(e).__name__}: {e}'
+
+
+def _issue(issue_type: str, issue_value: str, status: str = 'FAIL') -> dict:
+    return {'issue_type': issue_type, 'issue_value': issue_value, 'status': status}
+
+
+def _record(base: dict, status: str, issue_type: str = '', issue_value: str = '') -> dict:
+    """One result row with columns `RESULT_COLUMNS`."""
+    return {
+        **base,
+        'inputs_correct': INPUTS_CORRECT_BY_STATUS[status],
+        'issue_type': issue_type,
+        'issue_value': issue_value,
+        'status': status,
+    }
+
+
+def _product_records(base: dict, issues: list[dict]) -> list[dict]:
+    """Return a product's rows: one FAIL row per failing issue, or one PASS row if none fails, then any INFO rows."""
+    failing = [_record(base, i['status'], i['issue_type'], i['issue_value']) for i in issues if i['status'] != 'INFO']
+    notes = [_record(base, 'INFO', i['issue_type'], i['issue_value']) for i in issues if i['status'] == 'INFO']
+    return (failing or [_record(base, 'PASS')]) + notes
 
 
 def checkpoint_context(rtc_sha256: str, options: dict | None = None) -> str:
@@ -245,7 +314,13 @@ def checkpoint_context(rtc_sha256: str, options: dict | None = None) -> str:
         'rtc_sha256': rtc_sha256,
         'tool_version': manifest.tool_version(),
         'enumerator_version': manifest.enumerator_version(),
-        'enumeration': [DELTA_LOOKBACK_DAYS, MAX_PRE_IMGS_PER_BURST, DELTA_WINDOW_DAYS, POST_DATE_BUFFER_SECONDS],
+        'enumeration': [
+            DELTA_LOOKBACK_DAYS,
+            MAX_PRE_IMGS_PER_BURST,
+            DELTA_WINDOW_DAYS,
+            POST_DATE_BUFFER_SECONDS,
+            PASS_MATCH_TOLERANCE_SECONDS,
+        ],
         'options': options or {},
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
@@ -285,7 +360,10 @@ def check_inputs_offline(
     `checkpoint_context`). A product is reused only if its stored fingerprint equals the current one, so a changed
     RTC-S1 table, tag row, tag source, tool or enumerator version, or option recomputes it (F04). Rows that could
     not be checked (tag read error, enumeration error) are never written to the checkpoint, so they are always
-    recomputed. A checkpoint without fingerprints (written before this rule) is recomputed in full.
+    recomputed. A checkpoint without fingerprints or a `status` column (written before those rules) is recomputed
+    in full.
+
+    Products are grouped by the tile in their own opera_id, not the tile in their tags (F05).
     """
     fingerprints = product_fingerprints(df_tags, context)
     records: list[dict] = []
@@ -294,7 +372,7 @@ def check_inputs_offline(
     checkpoint_path = Path(checkpoint_path) if checkpoint_path else None
     if checkpoint_path and checkpoint_path.exists():
         df_ck = pd.read_parquet(checkpoint_path)
-        if {'opera_id', 'fingerprint'} <= set(df_ck.columns):
+        if {'opera_id', 'fingerprint', 'status'} <= set(df_ck.columns):
             current = df_ck.opera_id.map(fingerprints)
             df_other = df_ck[current.isna()]  # other products' rows, kept as they are
             df_mine = df_ck[current.notna()]
@@ -308,17 +386,16 @@ def check_inputs_offline(
     df_todo = df_tags[~df_tags.opera_id.isin(done_opera)]
     df_err = df_todo[df_todo.error != '']
     records.extend(
-        {
-            'opera_id': row.opera_id,
-            'mgrs_tile_id': row.mgrs_tile_id,
-            'inputs_correct': None,
-            'issue_type': 'Missing tag URL' if row.error == MISSING_TAG_URL else 'Tag read error',
-            'issue_value': row.error,
-        }
+        _record(
+            {'opera_id': row.opera_id, 'mgrs_tile_id': own_tile(row.opera_id)},
+            'UNKNOWN',
+            'Missing tag URL' if row.error == MISSING_TAG_URL else 'Tag read error',
+            row.error,
+        )
         for row in df_err.itertuples()
     )
     df_ok = df_todo[df_todo.error == '']
-    tags_by_tile = dict(tuple(df_ok.groupby('mgrs_tile_id')))
+    tags_by_tile = dict(tuple(df_ok.groupby(df_ok.opera_id.map(own_tile))))
     frame_tiles = set(df_rtc_frame.mgrs_tile_id.unique())
 
     def _flush() -> None:
@@ -337,13 +414,12 @@ def check_inputs_offline(
     for tile, df_tags_tile in sorted(tags_by_tile.items()):
         if tile not in frame_tiles:
             records.extend(
-                {
-                    'opera_id': row.opera_id,
-                    'mgrs_tile_id': tile,
-                    'inputs_correct': False,
-                    'issue_type': 'No expected product found',
-                    'issue_value': f'tile={tile} absent from RTC-S1 table',
-                }
+                _record(
+                    {'opera_id': row.opera_id, 'mgrs_tile_id': tile},
+                    'FAIL',
+                    'No expected product found',
+                    f'tile={tile} absent from RTC-S1 table',
+                )
                 for row in df_tags_tile.itertuples()
             )
             continue
@@ -402,7 +478,7 @@ def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataF
     def _one(row: tuple) -> list[dict]:
         base = {'opera_id': row.opera_id, 'mgrs_tile_id': row.mgrs_tile_id}
         if row.error:
-            return [{**base, 'inputs_correct': None, 'issue_type': 'Tag read error', 'issue_value': row.error}]
+            return [_record(base, 'UNKNOWN', 'Tag read error', row.error)]
         try:
             df_actual = parse_actual_inputs(row.pre_rtc_opera_ids, row.post_rtc_opera_ids)
             df_post = df_actual[df_actual.input_category == 'post']
@@ -411,17 +487,8 @@ def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataF
             pol_by_opera_id = dict(zip(df_expected.opera_id_trunc, df_expected.polarizations))
             issues = compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id)
         except Exception as e:
-            return [
-                {
-                    **base,
-                    'inputs_correct': None,
-                    'issue_type': 'Enumeration error',
-                    'issue_value': f'{type(e).__name__}: {e}',
-                }
-            ]
-        if not issues:
-            return [{**base, 'inputs_correct': True, 'issue_type': '', 'issue_value': ''}]
-        return [{**base, 'inputs_correct': False, **issue} for issue in issues]
+            return [_record(base, 'UNKNOWN', 'Enumeration error', _error_text(e))]
+        return _product_records(base, issues)
 
     rows = list(df_tags.itertuples())
     with (
@@ -430,4 +497,4 @@ def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataF
         ThreadPoolExecutor(max_workers=max_workers) as pool,
     ):
         results = list(tqdm(pool.map(_one, rows), total=len(rows), desc='Checking inputs (online)'))
-    return pd.DataFrame([record for result in results for record in result])
+    return _results_frame([record for result in results for record in result])

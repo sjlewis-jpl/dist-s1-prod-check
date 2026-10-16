@@ -2,7 +2,6 @@ import warnings
 
 import geopandas as gpd
 import pandas as pd
-import pytest
 
 from dist_s1_prod_check import inputs
 from dist_s1_prod_check.cmr import build_rtc_input_frame
@@ -54,8 +53,7 @@ def _status_by_product(df_results: pd.DataFrame) -> dict[str, bool]:
     return {oid: bool((grp.inputs_correct == True).all()) for oid, grp in df_results.groupby('opera_id')}  # noqa: E712
 
 
-# aa2014f: A is matched to expected product B through its own tags, so inputs_correct is True and no issue is raised
-@pytest.mark.xfail(strict=True, reason='F05: expected product is chosen from the tags, so a mislabelled product passes')
+# F05: the expected product is chosen from the product's own opera_id (acquisition A), not from its tags (B).
 def test_f05_mislabelled_product_fails_identity_mismatch() -> None:
     frame = _rtc_frame()
     tags_b = _expected_inputs(frame, T_B)
@@ -70,8 +68,7 @@ def test_f05_mislabelled_product_fails_identity_mismatch() -> None:
     assert rows_a.issue_type.str.lower().str.contains('identity mismatch').any()
 
 
-# aa2014f: both B and B2 (acq 30 s later, same tags) map to expected product B and both pass
-@pytest.mark.xfail(strict=True, reason='F05: one expected product can satisfy two DIST products')
+# F05: B and B2 (acq 30 s later, same tags) both map to expected product B; the closer one (B) claims it.
 def test_f05_two_products_one_expected_product_second_fails() -> None:
     frame = _rtc_frame()
     tags_b = _expected_inputs(frame, T_B)
@@ -83,3 +80,32 @@ def test_f05_two_products_one_expected_product_second_fails() -> None:
 
     assert sorted(status.values()) == [False, True], f'actual-to-expected must be one-to-one: {status}'
     assert status[id_b] and not status[id_b2]
+
+
+def test_f05_tag_tile_disagreeing_with_opera_id_fails_identity_mismatch() -> None:
+    frame = _rtc_frame()
+    id_b = dist_id(TILE, T_B, PROC)
+    df_tags = make_tags([{'opera_id': id_b, 'mgrs_tile_id': '10SGD', **_expected_inputs(frame, T_B)}])
+
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    rows = df[df.issue_type == 'Identity mismatch']
+    assert len(rows) == 1 and '10SGD' in rows.issue_value.iloc[0], df.to_dict('records')
+    assert set(df.mgrs_tile_id) == {TILE}, 'rows carry the tile of the opera_id'
+    assert set(df.status) == {'FAIL'} and not df.inputs_correct.any()
+
+
+def test_f05_claim_tie_goes_to_smaller_opera_id_and_status_column_set() -> None:
+    frame = _rtc_frame()
+    tags_b = _expected_inputs(frame, T_B)
+    id_s1a, id_s1c = dist_id(TILE, T_B, PROC, sensor='S1A'), dist_id(TILE, T_B, PROC, sensor='S1C')
+    df_tags = make_tags([{'opera_id': id_s1c, **tags_b}, {'opera_id': id_s1a, **tags_b}])
+
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    assert list(df.columns) == inputs.RESULT_COLUMNS
+    by_id = {oid: grp for oid, grp in df.groupby('opera_id')}
+    assert by_id[id_s1a].status.tolist() == ['PASS'] and by_id[id_s1a].inputs_correct.tolist() == [True]
+    loser = by_id[id_s1c]
+    assert loser.issue_type.tolist() == ['Expected product already claimed']
+    assert id_s1a in loser.issue_value.iloc[0] and loser.status.tolist() == ['FAIL']
