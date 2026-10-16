@@ -40,9 +40,19 @@ shapely = ">=2.1.2,<3"
 earthaccess = ">=0.18.0,<0.19"
 asf_search = ">=6.3.1,<7"
 pandera = ">=0.32.1,<0.33"
+pytest = ">=9.1.1,<10"
 [tool.pixi.tasks]
 lint = "ruff check ."
 format = "ruff format ."
+test = "pytest -q"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "data: needs tests/data subset",
+    "network: hits CMR/ASF",
+]
+addopts = "-m 'not network'"
 
 [tool.ruff]
 line-length = 120

@@ -113,7 +113,7 @@ venue_option = click.option(
     default='PROD',
     show_default=True,
     callback=lambda ctx, param, value: value.upper(),
-    help='Venue of the DIST-S1 products: ASF PROD or UAT CMR, or OPS-POP1 to list them from that cluster\'s product '
+    help="Venue of the DIST-S1 products: ASF PROD or UAT CMR, or OPS-POP1 to list them from that cluster's product "
     'bucket (RTC-S1 inputs always come from PROD).',
 )
 
