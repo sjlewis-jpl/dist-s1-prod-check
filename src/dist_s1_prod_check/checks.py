@@ -22,10 +22,23 @@ def filter_product_versions(df_dist: pd.DataFrame, allowed: list[str]) -> tuple[
     return df_dist[keep].reset_index(drop=True), excluded
 
 
+def attach_version_context(df_dist: pd.DataFrame) -> pd.DataFrame:
+    """Add `n_versions`, the number of versions of each product's acquisition in `df_dist`.
+
+    Call it on the full (version-filtered) table before any processing-time filter, so a campaign run still knows
+    that an acquisition was produced before (F18, decision 1); `deduplicate_products` then keeps the column.
+    """
+    return df_dist.assign(n_versions=df_dist.groupby('opera_dedup_id')['opera_id'].transform('size'))
+
+
 def deduplicate_products(df_dist: pd.DataFrame) -> pd.DataFrame:
-    """Keep one product per tile/acquisition: the one processed last (ties: the greatest opera_id)."""
+    """Keep one product per tile/acquisition: the one processed last (ties: the greatest opera_id).
+
+    `n_versions` is taken from `df_dist` when present (see `attach_version_context`), else counted in `df_dist`.
+    """
     df = df_dist.sort_values(VERSION_ORDER, kind='stable').copy()
-    df['n_versions'] = df.groupby('opera_dedup_id')['opera_id'].transform('size')
+    if 'n_versions' not in df.columns:
+        df['n_versions'] = df.groupby('opera_dedup_id')['opera_id'].transform('size')
     df = df[~df.duplicated(subset='opera_dedup_id', keep='last')]
     return df.sort_values(['mgrs_tile_id', 'acq_time']).reset_index(drop=True)
 

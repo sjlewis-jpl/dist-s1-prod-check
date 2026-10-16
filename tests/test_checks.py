@@ -35,11 +35,14 @@ def _run_capturing(
     monkeypatch.setattr(boto3, 'client', _no_network)
     captured: dict = {'sections': [], 'csvs': {}}
 
-    def _capture(out_dir: Path, stamp: str, tile_geoms: object, sections: list[dict], csvs: dict, *a: object) -> None:
-        captured['sections'].extend(sections)
+    def _csvs(out_dir: Path, stamp: str, csvs: dict) -> None:
         captured['csvs'].update(csvs)
 
-    monkeypatch.setattr(cli_module, '_write_outputs', _capture)
+    def _report(out_dir: Path, stamp: str, tile_geoms: object, sections: list[dict], *a: object, **k: object) -> None:
+        captured['sections'].extend(sections)
+
+    monkeypatch.setattr(cli_module, '_write_csvs', _csvs)
+    monkeypatch.setattr(cli_module, '_write_report', _report)
     result = cli_runner.invoke(cli, args)
     assert result.exit_code == 0, result.output + repr(result.exception)
     return captured['sections'], captured['csvs']
@@ -130,7 +133,6 @@ def test_f08_first_production_view_flags_inversion(
 
 
 # aa2014f: the ordering section has no n_skipped; only 1 of 3 acquisitions is evaluated and it reads "0 flagged"
-@pytest.mark.xfail(strict=True, reason='F08: retained-version ordering does not report acquisitions not evaluated')
 def test_f08_retained_view_reports_not_evaluated(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

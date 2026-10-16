@@ -215,7 +215,7 @@ class _Run:
         for section in sections:
             click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
         self.sections.extend(sections)
-        self.manifest.outputs.extend(_write_csvs(self.out_dir, self.stamp, csvs))
+        self.manifest.outputs.extend(_write_csvs(self.out_dir, self.stamp, csvs) or [])
         self.done.append(key)
 
     def _status_dict(self, state: status.RunState, error: str | None = None) -> dict:
@@ -234,8 +234,10 @@ class _Run:
             self.sections,
             self.title,
             self.subtitle,
-            run_status=self._status_dict(status.RunState.COMPLETE),
-            provenance=self.manifest.to_dict(),
+            self._status_dict(
+                status.RunState.COMPLETE
+            ),  # positional: tests capture _write_report(out_dir, stamp, tile_geoms, sections, *a)
+            self.manifest.to_dict(),
         )
         status.write_run_status(
             self.out_dir, status.RunState.COMPLETE, checks_planned=self.checks, checks_done=self.done
@@ -262,8 +264,10 @@ class _Run:
                 self.sections,
                 self.title,
                 self.subtitle,
-                run_status=self._status_dict(status.RunState.INCOMPLETE, error),
-                provenance=self.manifest.to_dict(),
+                self._status_dict(
+                    status.RunState.INCOMPLETE, error
+                ),  # positional: tests capture _write_report(out_dir, stamp, tile_geoms, sections, *a)
+                self.manifest.to_dict(),
             )
         except Exception as report_exc:  # noqa: BLE001
             click.echo(f'Could not write the partial report: {type(report_exc).__name__}: {report_exc}', err=True)
@@ -1230,6 +1234,8 @@ def run_all(
             'n_kept': int(in_window.sum()),
         }
         df_dist = df_dist[in_window].reset_index(drop=True)
+        # Version context comes from every version in the window, before any processing filter (F18).
+        df_dist = checks.attach_version_context(df_dist)
         if processing_start or processing_stop:
             n_before = len(df_dist)
             df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)

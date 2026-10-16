@@ -299,7 +299,6 @@ def _run_all_processing_window(
 
 
 # aa2014f: the processing filter runs before deduplication, so A-v2 gets n_versions=1 and is_reprocessed=False
-@pytest.mark.xfail(strict=True, reason='F18: n_versions is recomputed inside the processing window')
 def test_f18_n_versions_from_unfiltered_table(
     tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
