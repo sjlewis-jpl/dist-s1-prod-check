@@ -142,10 +142,33 @@ def test_f28_s3_listing_window_converted_to_utc(monkeypatch: pytest.MonkeyPatch)
         day = prefix.removeprefix('products/DIST_S1/').rstrip('/')
         listed.append(day)
         ids = [dist_id('10SGC', a, '2026-01-03T00:00:00') for a in acqs.get(day, [])]
-        return [f'{prefix}{i}/' for i in ids]
+        return [f'{prefix}{i}/{i}_GEN-DIST-STATUS.tif' for i in ids]
 
-    monkeypatch.setattr(cmr, '_list_s3_prefixes', fake_list)
+    monkeypatch.setattr(cmr, '_list_s3_keys', fake_list)
     df = cmr._list_dist_s1_s3('2026-01-02T00:00:00+02:00', '2026-01-03', 'bucket', max_workers=1)
 
     assert '2026/01/01' in listed
     assert sorted(df.acq_time.dt.strftime('%H:%M')) == ['05:00', '23:30']
+
+
+# c27b56b: the listing saw only product folders, so a product whose STATUS layer was never written had an alert_url
+# and counted as delivered.
+def test_f14_s3_product_without_status_key_has_no_alert_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from factories import dist_id
+
+    complete = dist_id('10SGC', '2026-01-02T02:06:53', '2026-01-03T00:00:00')
+    partial = dist_id('10SGC', '2026-01-02T14:06:53', '2026-01-03T00:00:00')
+
+    def fake_list(bucket: str, prefix: str) -> list[str]:
+        if not prefix.endswith('2026/01/02/'):
+            return []
+        layers = ['GEN-DIST-STATUS', 'GEN-METRIC', 'GEN-DIST-STATUS-ACQ']
+        keys = [f'{prefix}{complete}/{complete}_{layer}.tif' for layer in layers]
+        return keys + [f'{prefix}{partial}/{partial}_GEN-METRIC.tif', f'{prefix}{partial}/{partial}.png']
+
+    monkeypatch.setattr(cmr, '_list_s3_keys', fake_list)
+    df = cmr._list_dist_s1_s3('2026-01-01', '2026-01-03', 'bucket', max_workers=1).set_index('opera_id')
+
+    assert df.alert_url[complete].endswith(f'{complete}/{complete}_GEN-DIST-STATUS.tif')
+    assert df.alert_url.isna()[partial] and df.alert_acq_url.isna()[partial]
+    assert df.metric_url[partial].endswith('_GEN-METRIC.tif')

@@ -880,10 +880,14 @@ def _coverage_section(
     wkt_map: dict[str, str],
     state: SectionState = SectionState.COMPLETE,
     query_windows: list[manifest.QueryWindow] | None = None,
+    df_tags: pd.DataFrame | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_groups = coverage.expected_pass_groups(df_frame, start, stop)
-    df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame, query_windows=query_windows)
-    # FAIL (missing, baseline available) and UNKNOWN (lookback incomplete) passes both need attention.
+    df_cov = coverage.check_coverage(
+        df_groups, df_dedup, df_rtc_frame=df_frame, query_windows=query_windows, df_tags=df_tags
+    )
+    # FAIL (missing, baseline available) and UNKNOWN (lookback incomplete, latest product unreadable) passes both
+    # need attention.
     df_missing = df_cov[df_cov.status.isin([Status.FAIL, Status.UNKNOWN])]
     df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids', 'burst_pols'], errors='ignore'), wkt_map)
     df_missing['asf_search_url'] = [
@@ -912,7 +916,8 @@ def _coverage_section(
         'coverage',
         'Coverage',
         'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none (FAIL), '
-        'and missing passes whose baseline windows were not all queried to completion (UNKNOWN).',
+        'missing passes whose baseline windows were not all queried to completion (UNKNOWN), and passes whose '
+        'latest product could not be read (UNKNOWN: latest product unreadable).',
         df_missing,
         int(df_cov.status.isin(EVALUATED).sum()),
         summary=summary,
@@ -1061,6 +1066,13 @@ def _check_coverage_standalone(
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_dedup = checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions))
     df_rtc, m_rtc = _load_rtc_checked(data_dir, run, start, stop)
+    # Readability of the latest versions comes from the cached tags, if any; a product with no cached row is
+    # not known to be unreadable (missing='').
+    df_tags = (
+        tags.align_to_products(df_dedup, _load_tags(data_dir), missing='')
+        if (data_dir / TAGS_PARQUET).exists()
+        else None
+    )
     return _coverage_section(
         df_dedup,
         _build_rtc_frame(df_rtc, run, _load_target_tiles(data_dir)),
@@ -1068,6 +1080,7 @@ def _check_coverage_standalone(
         stop,
         _wkt_by_tile(_all_tile_geoms()),
         query_windows=m_rtc.lookback_windows,
+        df_tags=df_tags,
     )
 
 
@@ -1274,7 +1287,14 @@ def run_all(
                 checkpoint_context=_inputs_checkpoint_context(m_rtc, frame_tiles),
             ),
             'coverage': lambda: _coverage_section(
-                df_dedup, df_frame, start, stop, wkt_map, all_state, query_windows=m_rtc.lookback_windows
+                df_dedup,
+                df_frame,
+                start,
+                stop,
+                wkt_map,
+                all_state,
+                query_windows=m_rtc.lookback_windows,
+                df_tags=df_tags,
             ),
         }
         for key in RUN_ALL_CHECKS:

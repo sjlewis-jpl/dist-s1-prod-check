@@ -87,7 +87,7 @@
       "confirmation_failures": 563,
       "confirmation_tiles": 19,
       "coverage": 747,
-      "coverage_missing": 78,
+      "coverage_missing": 80,
       "coverage_missing_by_tile": 3,
       "coverage_orphans": 0,
       "duplicates": 5,
@@ -104,8 +104,8 @@
         "n_failures": 563
       },
       "coverage": {
-        "n_checked": 671,
-        "n_failures": 78
+        "n_checked": 669,
+        "n_failures": 80
       },
       "duplicates": {
         "n_checked": 585,

@@ -42,7 +42,6 @@ def _fake_get_tags(unreadable_urls: set[str], post_ids: dict[str, list[str]]) ->
 
 
 # aa2014f: coverage CSV has no status column; the pass is product_found=True, matched to the unreadable latest version
-@pytest.mark.xfail(strict=True, reason='F14: a 404 on the latest STATUS layer still counts as delivered for coverage')
 def test_f14_latest_status_404_is_unknown_in_coverage(
     tmp_data_dir: Path, tmp_path: Path, cli_runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

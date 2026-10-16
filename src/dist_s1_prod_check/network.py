@@ -1,6 +1,6 @@
 """Offline mode: one switch, checked at every point where the tool would reach the network.
 
-`network_allowed(step)` is called at the top of `cmr.search_granules`, `cmr._list_s3_prefixes`, `tags.get_tags`,
+`network_allowed(step)` is called at the top of `cmr.search_granules`, `cmr._list_s3_keys`, `tags.get_tags`,
 `tags.fetch_tags_table` and `inputs._enumerate_one`. In offline mode it raises an `OfflineError` naming the step,
 so a run can only use cached data and never fetches or re-queries anything silently.
 """

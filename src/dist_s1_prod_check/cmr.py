@@ -308,37 +308,52 @@ def get_dist_s1_table(
     retry=retry_if_not_exception_type(OfflineError),
     reraise=True,
 )
-def _list_s3_prefixes(bucket: str, prefix: str) -> list[str]:
-    """Sub-prefixes ("directories") directly under `prefix`, via anonymous ListObjectsV2."""
+def _list_s3_keys(bucket: str, prefix: str) -> list[str]:
+    """Every object key under `prefix` (no delimiter), via anonymous ListObjectsV2."""
     network_allowed(f'listing s3://{bucket}/{prefix}')
     url = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
     ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
-    params = {'list-type': '2', 'prefix': prefix, 'delimiter': '/'}
-    prefixes = []
+    params = {'list-type': '2', 'prefix': prefix}
+    keys = []
     while True:
         resp = requests.get(url, params=params, timeout=120)
         resp.raise_for_status()
         root = ElementTree.fromstring(resp.content)
-        prefixes += [e.text for e in root.findall('s3:CommonPrefixes/s3:Prefix', ns)]
+        keys += [e.text for e in root.findall('s3:Contents/s3:Key', ns)]
         token = root.findtext('s3:NextContinuationToken', namespaces=ns)
         if not token:
-            return prefixes
+            return keys
         params['continuation-token'] = token
 
 
 def _list_dist_s1_s3(start_time: DateLike, stop_time: DateLike, bucket: str, max_workers: int = 8) -> pd.DataFrame:
-    """DIST-S1 products acquired in [start_time, stop_time), from the bucket's per-acquisition-day product folders."""
+    """DIST-S1 products acquired in [start_time, stop_time), from the bucket's per-acquisition-day product folders.
+
+    Lists every key, not just the product folders, so a product is known to have each layer only if that layer's
+    key exists. A layer whose key is missing gets a null URL; a product without its STATUS layer therefore has no
+    `alert_url`, its tags cannot be read (`missing_tag_url`) and coverage reports it UNKNOWN (F14).
+    """
     # Product ids carry UTC times without an offset: convert the window to UTC before dropping its offset (F28).
     start, stop = (_utc_naive(t) for t in (start_time, stop_time))
     days = pd.date_range(start.normalize(), (stop - pd.Timedelta(1, 'ns')).normalize(), freq='D')
     base = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
 
     def list_day(day: pd.Timestamp) -> list[dict]:
+        day_prefix = f'{DIST_S1_S3_PREFIX}/{day:%Y/%m/%d}/'
+        files: dict[str, set[str]] = {}
+        for key in _list_s3_keys(bucket, day_prefix):
+            parts = key.removeprefix(day_prefix).split('/')
+            if len(parts) == 2 and parts[0]:
+                files.setdefault(parts[0], set()).add(parts[1])
         records = []
-        for prefix in _list_s3_prefixes(bucket, f'{DIST_S1_S3_PREFIX}/{day:%Y/%m/%d}/'):
-            opera_id = prefix.rstrip('/').rsplit('/', 1)[-1]
+        for opera_id, names in sorted(files.items()):
             tokens = opera_id.split('_')
-            urls = {col: f'{base}{prefix}{opera_id}_{suffix}.tif' for col, suffix in LAYER_URL_MAP.items()}
+            urls = {
+                col: f'{base}{day_prefix}{opera_id}/{opera_id}_{suffix}.tif'
+                if f'{opera_id}_{suffix}.tif' in names
+                else None
+                for col, suffix in LAYER_URL_MAP.items()
+            }
             records.append(
                 {
                     'opera_id': opera_id,

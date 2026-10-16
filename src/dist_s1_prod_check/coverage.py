@@ -100,6 +100,7 @@ def check_coverage(
     delta_lookback_days: tuple[int, ...] = DELTA_LOOKBACK_DAYS,
     delta_window_days: int = DELTA_WINDOW_DAYS,
     query_windows: list[QueryWindow] | None = None,
+    df_tags: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Check every expected MGRS pass has a DIST-S1 product; missing passes are checked for baseline availability.
 
@@ -111,6 +112,10 @@ def check_coverage(
     status is UNKNOWN ("lookback incomplete"), because an unqueried window is not evidence of "no baseline".
     Without `query_windows` nothing is known to be complete. Status per pass: PASS (product found), FAIL
     (missing, baseline available), SKIPPED (missing, no baseline: not expected), UNKNOWN (lookback incomplete).
+
+    The product under test is always the latest version (`df_dist_dedup`), never an older readable copy. With
+    `df_tags`, a pass whose matched product has a tag error (its STATUS layer could not be read, or it has no
+    STATUS layer URL) is UNKNOWN "latest product unreadable" (F14): it exists but its delivery is not shown.
     """
     df_dist = df_dist_dedup.copy()
     df_dist['acq_time_utc'] = _to_utc(df_dist.acq_time)
@@ -123,6 +128,11 @@ def check_coverage(
         acq_by_burst_pol = {
             burst_pol: np.sort(group.acq_dt.values) for burst_pol, group in df_bursts.groupby(_burst_pol_key(df_bursts))
         }
+
+    unreadable: dict[str, str] = {}
+    if df_tags is not None and not df_tags.empty:
+        errors = df_tags.drop_duplicates(subset='opera_id', keep='last').set_index('opera_id').error.fillna('')
+        unreadable = errors[errors != ''].to_dict()
 
     records = []
     for row in df_expected_groups.itertuples():
@@ -149,6 +159,9 @@ def check_coverage(
             'status': Status.PASS,
             'reason': '',
         }
+        if product_found and matched_opera_id in unreadable:
+            record['status'] = Status.UNKNOWN
+            record['reason'] = f'latest product unreadable: {matched_opera_id} ({unreadable[matched_opera_id]})'
         if not product_found:
             if not lookback_complete(query_windows, row.post_acq_dt, delta_lookback_days, delta_window_days):
                 record['status'] = Status.UNKNOWN

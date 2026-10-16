@@ -327,3 +327,22 @@ def test_f18_coverage_text_states_whole_acquisition_window(
 
     (cov,) = [s for s in sections if s['key'] == 'coverage']
     assert 'acquisition window' in cov['description'].lower(), cov['description']
+
+
+# c27b56b: check_coverage had no df_tags argument; an unreadable latest version counted as delivered (PASS).
+@pytest.mark.parametrize('error', ['missing_tag_url', 'RasterioIOError: HTTP response code: 404'])
+def test_f14_unreadable_latest_product_is_unknown(error: str) -> None:
+    from factories import make_tags
+
+    frame, groups = _passes((0, T0))
+    df_dedup = _products(T0)
+    df_tags = make_tags([{'opera_id': _pid(T0), 'error': error}])
+
+    unread = coverage.check_coverage(groups, df_dedup, df_rtc_frame=frame, df_tags=df_tags).iloc[0]
+    readable = coverage.check_coverage(
+        groups, df_dedup, df_rtc_frame=frame, df_tags=make_tags([{'opera_id': _pid(T0)}])
+    )
+
+    assert unread.matched_opera_id == _pid(T0)
+    assert unread.status == 'UNKNOWN' and 'latest product unreadable' in unread.reason and error in unread.reason
+    assert readable.status.tolist() == ['PASS']
