@@ -165,7 +165,6 @@ T40 = T0 + pd.Timedelta(minutes=40)
 
 
 # aa2014f: the single product is nearest to both passes (0 s and 2400 s), so both passes are product_found
-@pytest.mark.xfail(strict=True, reason='F06: one product can cover two passes (independent nearest-time matching)')
 def test_f06a_one_product_covers_only_one_of_two_passes() -> None:
     frame, groups = _passes((0, T0), (2, T40))
     assert len(groups) == 2
@@ -177,7 +176,6 @@ def test_f06a_one_product_covers_only_one_of_two_passes() -> None:
 
 
 # aa2014f: both products are within 3600 s of the one pass, so check_orphan_products returns no orphan
-@pytest.mark.xfail(strict=True, reason='F06: two products near one pass hide an orphan')
 def test_f06b_second_product_near_one_pass_is_orphan() -> None:
     _, groups = _passes((0, T0))
 
@@ -188,7 +186,6 @@ def test_f06b_second_product_near_one_pass_is_orphan() -> None:
 
 
 # aa2014f: nearest-time matching maps both passes (0 s, 100 s) to the product at 90 s; the one at 120 s is unused
-@pytest.mark.xfail(strict=True, reason='F06: greedy nearest-time matching is not a one-to-one assignment')
 def test_f06c_optimal_assignment_beats_greedy() -> None:
     t100 = T0 + pd.Timedelta(seconds=100)
     p90, p120 = T0 + pd.Timedelta(seconds=90), T0 + pd.Timedelta(seconds=120)
@@ -222,7 +219,6 @@ def test_f06d_no_candidate_within_tolerance() -> None:
 
 # aa2014f: TypeError: check_coverage() got an unexpected keyword argument 'df_tags' (the tagged post bursts are
 # never consulted, so the product of acquisition group 2 is accepted for the group-0 pass)
-@pytest.mark.xfail(strict=True, reason='F06: acquisition group is not checked through the tagged post bursts')
 def test_f06e_tagged_group_mismatch_is_unknown() -> None:
     frame, groups = _passes((0, T0))
     df_dedup = _products(T0)
@@ -237,7 +233,6 @@ def test_f06e_tagged_group_mismatch_is_unknown() -> None:
 
 
 # aa2014f: coverage matches 1 of 2 products and the orphan check reports 0, so 1 product is in neither set
-@pytest.mark.xfail(strict=True, reason='F06: coverage and orphan checks do not share one assignment')
 def test_f06f_coverage_and_orphans_share_one_assignment(monkeypatch: pytest.MonkeyPatch) -> None:
     frame, groups = _passes((0, T0))
     df_dedup = _products(T0, T40)
@@ -344,3 +339,17 @@ def test_f14_unreadable_latest_product_is_unknown(error: str) -> None:
     assert unread.matched_opera_id == _pid(T0)
     assert unread.status == 'UNKNOWN' and 'latest product unreadable' in unread.reason and error in unread.reason
     assert readable.status.tolist() == ['PASS']
+
+
+def test_f06_ambiguous_pass_is_unknown_and_eligibility_is_evaluated_for_found_passes() -> None:
+    year_ago = T0 - pd.Timedelta(days=400)
+    frame, groups = _passes((0, T0), (0, year_ago))
+    groups = groups[groups.post_acq_dt.dt.tz_convert(None) == T0].reset_index(drop=True)
+    df_dedup = _products(T0 - pd.Timedelta(seconds=20), T0 + pd.Timedelta(seconds=20))
+
+    found = coverage.check_coverage(groups, _products(T0), df_rtc_frame=frame).iloc[0]
+    ambiguous = coverage.check_coverage(groups, df_dedup, df_rtc_frame=frame).iloc[0]
+
+    assert found.status == 'PASS' and found.eligible and found.n_bursts_with_baseline == found.n_bursts
+    assert found.acq_group_id_within_mgrs_tile == 0
+    assert ambiguous.status == 'UNKNOWN' and ambiguous.reason.startswith('ambiguous match')

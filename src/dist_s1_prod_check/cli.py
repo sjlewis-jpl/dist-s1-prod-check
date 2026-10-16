@@ -936,18 +936,22 @@ def _coverage_section(
     query_windows: list[manifest.QueryWindow] | None = None,
     df_tags: pd.DataFrame | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    from dist_s1_prod_check import matching
+
     df_groups = coverage.expected_pass_groups(df_frame, start, stop)
+    # One assignment feeds both checks, so every product is either matched to a pass or an orphan (F06).
+    assignment = matching.assign_passes(df_groups, df_dedup)
     df_cov = coverage.check_coverage(
-        df_groups, df_dedup, df_rtc_frame=df_frame, query_windows=query_windows, df_tags=df_tags
+        df_groups, df_dedup, df_rtc_frame=df_frame, query_windows=query_windows, df_tags=df_tags, assignment=assignment
     )
-    # FAIL (missing, baseline available) and UNKNOWN (lookback incomplete, latest product unreadable) passes both
-    # need attention.
+    # FAIL (missing, baseline available) and UNKNOWN (lookback incomplete, latest product unreadable, ambiguous
+    # match, group mismatch) passes all need attention.
     df_missing = df_cov[df_cov.status.isin([Status.FAIL, Status.UNKNOWN])]
     df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids', 'burst_pols'], errors='ignore'), wkt_map)
     df_missing['asf_search_url'] = [
         _vertex_search_url(row.mgrs_tile_wkt, row.post_acq_dt) for row in df_missing.itertuples()
     ]
-    df_orphans = coverage.check_orphan_products(df_groups, df_dedup)
+    df_orphans = coverage.check_orphan_products(df_groups, df_dedup, assignment=assignment)
 
     summary = None
     df_by_tile = pd.DataFrame(columns=['mgrs_tile_id', 'n_missing', 'missing_post_dates'])
@@ -969,9 +973,12 @@ def _coverage_section(
     section = report.build_section(
         'coverage',
         'Coverage',
-        'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none (FAIL), '
-        'missing passes whose baseline windows were not all queried to completion (UNKNOWN), and passes whose '
-        'latest product could not be read (UNKNOWN: latest product unreadable).',
+        'The check expects every eligible pass in the acquisition window and AOI: an RTC-S1 pass with baseline '
+        'imagery must have triggered a DIST-S1 product. Listed: eligible passes with no product (FAIL), missing '
+        'passes whose baseline windows were not all queried to completion (UNKNOWN), passes whose latest product '
+        'could not be read (UNKNOWN: latest product unreadable), passes that match two products equally well '
+        '(UNKNOWN: ambiguous match), and passes whose product was made from another acquisition group '
+        '(UNKNOWN: group mismatch). Passes and products are matched one-to-one per tile.',
         df_missing,
         int(df_cov.status.isin(EVALUATED).sum()),
         summary=summary,

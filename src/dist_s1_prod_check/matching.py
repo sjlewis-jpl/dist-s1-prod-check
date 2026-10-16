@@ -45,7 +45,7 @@ class PassAssignment:
     orphan_products: list[str] = field(default_factory=list)
 
 
-def _pass_key(row: object) -> PassKey:
+def pass_key(row: object) -> PassKey:
     return (row.mgrs_tile_id, int(row.acq_group_id_within_mgrs_tile), int(row.pass_id))
 
 
@@ -165,7 +165,7 @@ def assign_passes(
     if len(df_expected_groups):
         for tile, group in df_expected_groups.groupby('mgrs_tile_id', sort=False):
             post = pd.to_datetime(group.post_acq_dt, utc=True).values.astype('datetime64[us]')
-            passes[tile] = ([_pass_key(row) for row in group.itertuples()], post)
+            passes[tile] = ([pass_key(row) for row in group.itertuples()], post)
     empty_ids, empty_times = [], np.array([], dtype='datetime64[us]')
     for tile in list(passes) + [t for t in products if t not in passes]:
         keys, post = passes.get(tile, ([], empty_times))
