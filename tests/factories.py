@@ -15,6 +15,7 @@ import geopandas as gpd
 import pandas as pd
 from dist_s1_enumerator.mgrs_burst_data import get_burst_table, get_lut_by_mgrs_tile_ids, get_mgrs_table
 
+from dist_s1_prod_check import cmr, manifest
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
     DIST_S1_S3_PREFIX,
@@ -58,6 +59,8 @@ RTC_COLUMNS = [
 TAG_COLUMNS = ['opera_id', 'error', *TAG_KEYS]
 
 DIST_BUCKET = 'opera-test-bucket'
+# Acquisition window the seeded manifests record by default; every synthetic run requests a window inside it.
+DEFAULT_WINDOW = ('2026-01-01', '2026-03-01')
 RTC_URL_BASE = 'https://datapool.asf.alaska.edu/RTC/OPERA-S1/'
 _POL_SUFFIXES = {'VV+VH': ('VV', 'VH'), 'HH+HV': ('HH', 'HV'), 'VV': ('VV', None), 'HH': ('HH', None)}
 
@@ -285,8 +288,13 @@ def seed_data_dir(
     tags: pd.DataFrame | None = None,
     venue: str = 'PROD',
     target_tiles: Iterable[str] | None = None,
+    window: tuple[str, str] = DEFAULT_WINDOW,
+    bbox: tuple[float, float, float, float] | None = None,
 ) -> Path:
     """Write cache files into ``data_dir`` so CLI commands run offline.
+
+    The DIST-S1 and RTC-S1 tables get ``query_receipt`` manifests, as if ``run-all`` had just queried `window`
+    (main and lookback windows, all complete) over `bbox`, so they pass the cache-compatibility checks.
 
     Parameters
     ----------
@@ -299,6 +307,10 @@ def seed_data_dir(
     target_tiles : iterable of str or None
         If given, written to ``target_mgrs_tiles.txt`` (what ``--bbox`` would have produced); it limits
         the MGRS tiles `build_rtc_input_frame` expands RTC rows to.
+    window : (start, stop)
+        Acquisition window the manifests record; a run must request a window inside it.
+    bbox : tuple or None
+        AOI the manifests record; a run must pass the same ``--bbox``.
 
     Returns
     -------
@@ -307,13 +319,32 @@ def seed_data_dir(
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
-    if dist is not None:
-        dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
-    if rtc is not None:
-        rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
-    if tags is not None:
-        tags.to_parquet(data_dir / TAGS_PARQUET, compression='zstd')
     if target_tiles is not None:
         (data_dir / TARGET_TILES_FILE).write_text('\n'.join(t.removeprefix('T') for t in target_tiles))
+    tiles = (data_dir / TARGET_TILES_FILE).read_text().split() if (data_dir / TARGET_TILES_FILE).exists() else None
+    start, stop = window
+    common = {'start': start, 'stop': stop, 'bbox': bbox, 'target_tiles': tiles}
+    if dist is not None:
+        dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+        manifest.write_table_manifest(
+            data_dir / DIST_S1_PARQUET,
+            table='dist_s1',
+            venue=venue,
+            source=f'{venue} (synthetic)',
+            lookback_windows=manifest.windows_with_counts([(start, stop)], dist.acq_time),
+            **common,
+        )
+    if rtc is not None:
+        rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+        manifest.write_table_manifest(
+            data_dir / RTC_S1_PARQUET,
+            table='rtc_s1',
+            venue='PROD',
+            source='PROD (synthetic)',
+            lookback_windows=manifest.windows_with_counts(cmr.lookback_date_ranges(start, stop), rtc.acq_dt),
+            **common,
+        )
+    if tags is not None:
+        tags.to_parquet(data_dir / TAGS_PARQUET, compression='zstd')
     (data_dir / VENUE_FILE).write_text(f'{venue}\n')
     return data_dir

@@ -8,6 +8,7 @@
       "2026-01-01",
       "--stop",
       "2026-03-01",
+      "--regression-baseline",
       "--workers",
       "1",
       "--inputs-workers",
@@ -30,11 +31,11 @@
     },
     "sections": {
       "confirmation": {
-        "n_checked": 618,
+        "n_checked": 599,
         "n_failures": 2
       },
       "coverage": {
-        "n_checked": 747,
+        "n_checked": 671,
         "n_failures": 42
       },
       "duplicates": {
@@ -72,6 +73,7 @@
       "2026-09-24",
       "--tag-url-template",
       "http://opera-int-rs-fwd.s3-website-us-west-2.amazonaws.com/products/DIST_S1/{acq_time:%Y/%m/%d}/{opera_id}/{opera_id}_GEN-DIST-STATUS.tif",
+      "--regression-baseline",
       "--workers",
       "1",
       "--inputs-workers",
@@ -94,11 +96,11 @@
     },
     "sections": {
       "confirmation": {
-        "n_checked": 582,
+        "n_checked": 563,
         "n_failures": 563
       },
       "coverage": {
-        "n_checked": 747,
+        "n_checked": 671,
         "n_failures": 78
       },
       "duplicates": {
@@ -106,15 +108,15 @@
         "n_failures": 5
       },
       "inputs": {
-        "n_checked": 582,
+        "n_checked": 580,
         "n_failures": 55
       },
       "inputs_post": {
-        "n_checked": 582,
+        "n_checked": 580,
         "n_failures": 6
       },
       "inputs_pre": {
-        "n_checked": 582,
+        "n_checked": 580,
         "n_failures": 41
       },
       "ordering": {

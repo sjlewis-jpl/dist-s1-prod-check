@@ -131,6 +131,89 @@ def _banner_html(run_status: dict) -> str:
     )
 
 
+def command_line(command: str, params: dict) -> str:
+    """Rebuild the command line from a run manifest's parameters (flags that are off and empty values omitted)."""
+    parts = [command]
+    for name, value in params.items():
+        flag = '--' + name.replace('_', '-')
+        if value is None or value is False or value == '' or value == []:
+            continue
+        if value is True:
+            parts.append(flag)
+        elif isinstance(value, list):
+            parts += [flag, *(str(v) for v in value)]
+        else:
+            parts += [flag, str(value)]
+    return ' '.join(parts)
+
+
+def _table_provenance(name: str, t: dict) -> tuple[str, str]:
+    """One provenance row per cached table. Receipts and adopted caches never share a time label."""
+    if t.get('provenance') == 'query_receipt':
+        kind, when = 'query receipt', f'query_time_utc {t.get("query_time_utc")}'
+    else:
+        kind, when = 'adopted cache (adopted_unverified)', f'file_mtime_utc (inferred) {t.get("file_mtime_utc")}'
+    windows = t.get('lookback_windows') or []
+    n_incomplete = sum(not w['complete'] for w in windows)
+    text = (
+        f'{kind}; {t.get("source")}; {t.get("start")} to {t.get("stop")}; bbox {t.get("bbox") or "none (global)"}; '
+        f'{t.get("n_rows"):,} rows; {len(windows)} query windows ({n_incomplete} incomplete); {when}; '
+        f'sha256 {str(t.get("parquet_sha256"))[:12]}...'
+    )
+    return f'{name} table', text
+
+
+def provenance_rows(prov: dict) -> list[tuple[str, str]]:
+    """Label/value rows of the provenance block, generated from a `RunManifest` dict only."""
+    rows = [
+        ('Command', command_line(prov['command'], prov.get('params', {}))),
+        ('Tool version', f'dist-s1-prod-check {prov.get("tool_version")}'),
+        ('Enumerator version', f'dist-s1-enumerator {prov.get("enumerator_version")}'),
+        ('Network', 'offline run (no network access; cached data only)' if prov.get('offline') else 'online run'),
+        ('Run type', 'regression baseline run' if prov.get('regression_baseline') else 'gate run'),
+    ]
+    vf = prov.get('version_filter') or {}
+    if vf:
+        excluded = ', '.join(f'{v}: {n:,}' for v, n in sorted(vf.get('excluded_by_version', {}).items()))
+        rows.append(
+            (
+                'Product versions',
+                f'{", ".join(vf["allowed"])}; excluded {vf.get("n_excluded", 0):,} products of other versions'
+                + (f' ({excluded})' if excluded else ''),
+            )
+        )
+    pf = prov.get('processing_filter') or {}
+    if pf:
+        rows.append(('Processing filter', f'processed {pf.get("start") or "start"} to {pf.get("stop") or "now"}; '
+                     f'kept {pf.get("n_kept", 0):,} of {pf.get("n_before", 0):,} products'))  # fmt: skip
+    for key, smp in (prov.get('sampling') or {}).items():
+        rows.append(
+            (
+                f'Sample: {key}',
+                f'{smp["n_selected"]:,} of {smp["n_universe"]:,} {smp.get("unit", "products")} (seed {smp["seed"]}, '
+                f'selected ids sha256 {smp["selected_sha256"][:12]}...)',
+            )
+        )
+    rows += [_table_provenance(name, t) for name, t in (prov.get('tables') or {}).items()]
+    for name, sha in (prov.get('file_sha256') or {}).items():
+        rows.append((name, f'sha256 {sha[:12]}... (no manifest; per-product cache)'))
+    rows += [('Not checked', text) for text in prov.get('disclaimers', [])]
+    return rows
+
+
+def _provenance_html(prov: dict | None) -> str:
+    if not prov:
+        return ''
+    banner = (
+        '<div class="banner adopted"><b>ADOPTED CACHE: provenance unverified (regression run).</b> The cached tables '
+        'were adopted with adopt-cache; nothing proves what was queried. This report cannot serve as a gate.</div>'
+        if prov.get('adopted_cache')
+        else ''
+    )
+    body = ''.join(f'<tr><th>{escape(k)}</th><td>{escape(v)}</td></tr>' for k, v in provenance_rows(prov))
+    return f'{banner}<details class="prov" open><summary>Provenance</summary><table>{body}</table></details>'
+
+
 def write_html_report(
     sections: list[dict],
     tile_geoms: gpd.GeoDataFrame,
@@ -138,11 +221,13 @@ def write_html_report(
     title: str = 'DIST-S1 Production Check',
     subtitle: str = '',
     run_status: dict | None = None,
+    provenance: dict | None = None,
 ) -> Path:
     """Write a self-contained HTML report: map of failing MGRS tiles, stat tiles, and per-check tables with CSV export.
 
     `run_status` is ``{'state', 'failed_check', 'error', 'not_run'}``. Unless its state is COMPLETE the page opens
     with an INCOMPLETE banner, and the failed and never-run checks are drawn as grey tiles (they are not sections).
+    `provenance` is a `RunManifest` dict; the provenance block is generated from it alone.
     """
     payload = {
         'title': title,
@@ -161,7 +246,7 @@ def write_html_report(
     data_js = json.dumps(payload, default=str).replace('</', '<\\/')
     html = (
         _TEMPLATE.replace('__TITLE__', title)
-        .replace('__BANNER__', _banner_html(payload['run_status']))
+        .replace('__BANNER__', _banner_html(payload['run_status']) + _provenance_html(provenance))
         .replace('__DATA__', data_js)
     )
     out_path = Path(out_path)
@@ -235,6 +320,12 @@ _TEMPLATE = r"""<!doctype html>
   td a { color: inherit; text-decoration: underline; text-decoration-color: var(--muted); }
   .banner { background: var(--critical); color: #fff; border-radius: 10px; padding: 12px 16px; margin-top: 14px;
             font-size: 0.95rem; }
+  .banner.adopted { background: #b26b00; }
+  .prov { margin-top: 12px; font-size: 0.8rem; color: var(--text-secondary); }
+  .prov summary { cursor: pointer; }
+  .prov table { width: auto; margin-top: 6px; }
+  .prov th { position: static; cursor: default; padding: 3px 10px 3px 0; vertical-align: top; }
+  .prov td { white-space: normal; max-width: 1000px; padding: 3px 0; }
   .tile.grey { opacity: 0.75; } .tile .value.na { color: var(--muted); }
   .empty.na { color: var(--muted); }
   .empty { color: var(--good); font-size: 0.9rem; padding: 8px 0; }

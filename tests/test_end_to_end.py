@@ -134,6 +134,13 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
         pytest.skip(f'no {venue} subset in {TESTS_DATA} or {SUBSET_ROOT}; run scripts/make_test_subset.py')
     data_dir, out_dir = tmp_path / 'data', tmp_path / 'out'
     shutil.copytree(subset, data_dir)
+    # The subset was cut from caches built before manifests existed: adopt the copy with the baseline's arguments.
+    adopt_args = [a for a in VENUE_ARGS[venue] if a not in ('--processing-start', '2026-09-24')]
+    adopt_args = (
+        adopt_args[: adopt_args.index('--tag-url-template')] if '--tag-url-template' in adopt_args else adopt_args
+    )
+    adopted = cli_runner.invoke(cli, ['adopt-cache', *adopt_args, '--data-dir', str(data_dir)])
+    assert adopted.exit_code == 0, adopted.output
 
     attempts = _install_network_blocks(monkeypatch)
     # aa2014f retries cached tag rows holding a read error on every run (tags.fetch_tags_table, retry_errors=True),
@@ -148,7 +155,7 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
 
     monkeypatch.setattr(report, 'write_html_report', _capture)
 
-    args = ['run-all', *VENUE_ARGS[venue], '--workers', '1', '--inputs-workers', '1']
+    args = ['run-all', *VENUE_ARGS[venue], '--regression-baseline', '--workers', '1', '--inputs-workers', '1']
     result = cli_runner.invoke(cli, [*args, '--data-dir', str(data_dir), '--out-dir', str(out_dir)])
     assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
     assert attempts == []

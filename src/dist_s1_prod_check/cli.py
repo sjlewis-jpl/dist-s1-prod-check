@@ -6,9 +6,10 @@ import click
 import geopandas as gpd
 import pandas as pd
 
-from dist_s1_prod_check import checks, coverage, inputs, report, status, tags
+from dist_s1_prod_check import checks, coverage, inputs, manifest, report, status, tags
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
+    DIST_S1_S3_BUCKETS,
     INPUTS_CHECKPOINT_PARQUET,
     RTC_CHUNKS_DIR,
     RTC_S1_PARQUET,
@@ -31,11 +32,39 @@ def _load_dist(data_dir: Path) -> gpd.GeoDataFrame:
     return gpd.read_parquet(path)
 
 
-def _load_rtc(data_dir: Path) -> gpd.GeoDataFrame:
-    path = data_dir / RTC_S1_PARQUET
+def _venue_of(data_dir: Path) -> str | None:
+    marker = data_dir / VENUE_FILE
+    return marker.read_text().strip() if marker.exists() else None
+
+
+def _load_cached(
+    data_dir: Path, filename: str, run: '_Run', request: manifest.CacheRequest
+) -> tuple[gpd.GeoDataFrame, manifest.TableManifest]:
+    """Load a cached metadata table after checking its manifest (sha256, provenance, venue, window, AOI)."""
+    path = data_dir / filename
     if not path.exists():
         raise click.ClickException(f'{path} not found; run `dist-s1-prod-check download-metadata` first.')
-    return gpd.read_parquet(path)
+    m = manifest.load_table_manifest(path)
+    manifest.require_compatible(m, request, path=path, regression_baseline=run.manifest.regression_baseline)
+    run.manifest.tables[m.table] = m.to_dict()
+    return gpd.read_parquet(path), m
+
+
+def _load_dist_checked(data_dir: Path, run: '_Run') -> gpd.GeoDataFrame:
+    """DIST-S1 table for a standalone check command (no window or AOI to match)."""
+    df, _ = _load_cached(data_dir, DIST_S1_PARQUET, run, manifest.CacheRequest(venue=_venue_of(data_dir) or 'PROD'))
+    return df
+
+
+def _load_rtc_checked(
+    data_dir: Path, run: '_Run', start: str | None = None, stop: str | None = None
+) -> tuple[gpd.GeoDataFrame, manifest.TableManifest]:
+    return _load_cached(data_dir, RTC_S1_PARQUET, run, manifest.CacheRequest('PROD', start, stop))
+
+
+def _record_file(run: '_Run', path: Path) -> None:
+    if path.exists():
+        run.manifest.file_sha256[path.name] = manifest.sha256_file(path)
 
 
 def _load_tags(data_dir: Path) -> pd.DataFrame:
@@ -78,12 +107,14 @@ def _build_rtc_frame(df_rtc: gpd.GeoDataFrame, data_dir: Path) -> gpd.GeoDataFra
     return build_rtc_input_frame(df_rtc, mgrs_tile_ids=_load_target_tiles(data_dir))
 
 
-def _write_csvs(out_dir: Path, stamp: str, csvs: dict[str, pd.DataFrame]) -> None:
+def _write_csvs(out_dir: Path, stamp: str, csvs: dict[str, pd.DataFrame]) -> list[str]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    names = []
     for name, df in csvs.items():
-        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(
-            out_dir / f'{name}_{stamp}.csv', index=False
-        )
+        path = out_dir / f'{name}_{stamp}.csv'
+        df.drop(columns=[c for c in ['geometry'] if c in df.columns]).to_csv(path, index=False)
+        names.append(path.name)
+    return names
 
 
 def _write_report(
@@ -94,12 +125,20 @@ def _write_report(
     title: str,
     subtitle: str,
     run_status: dict | None = None,
-) -> None:
+    provenance: dict | None = None,
+) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     html_path = report.write_html_report(
-        sections, tile_geoms, out_dir / f'report_{stamp}.html', title, subtitle, run_status=run_status
+        sections,
+        tile_geoms,
+        out_dir / f'report_{stamp}.html',
+        title,
+        subtitle,
+        run_status=run_status,
+        provenance=provenance,
     )
     click.echo(f'Wrote {html_path}')
+    return html_path
 
 
 class _Run:
@@ -111,8 +150,9 @@ class _Run:
     partial report is logged and never replaces the original exception.
     """
 
-    def __init__(self, out_dir: Path, stamp: str, checks: list[str], title: str) -> None:
+    def __init__(self, out_dir: Path, stamp: str, checks: list[str], title: str, regression_baseline: bool) -> None:
         self.out_dir, self.stamp, self.checks, self.title = out_dir, stamp, checks, title
+        self.manifest = _new_run_manifest(regression_baseline)
         self.subtitle = ''
         self.current = 'setup'
         self.done: list[str] = []
@@ -129,7 +169,7 @@ class _Run:
         for section in sections:
             click.echo(f'{section["title"]}: {section["n_failures"]} flagged of {section["n_checked"]} checked')
         self.sections.extend(sections)
-        _write_csvs(self.out_dir, self.stamp, csvs)
+        self.manifest.outputs.extend(_write_csvs(self.out_dir, self.stamp, csvs))
         self.done.append(key)
 
     def _status_dict(self, state: status.RunState, error: str | None = None) -> dict:
@@ -139,6 +179,8 @@ class _Run:
 
     def complete(self) -> None:
         self.current = 'report'
+        self.manifest.outputs += [f'report_{self.stamp}.html', manifest.RUN_MANIFEST_FILE, status.RUN_STATUS_FILE]
+        self.manifest.write(self.out_dir)
         _write_report(
             self.out_dir,
             self.stamp,
@@ -147,6 +189,7 @@ class _Run:
             self.title,
             self.subtitle,
             run_status=self._status_dict(status.RunState.COMPLETE),
+            provenance=self.manifest.to_dict(),
         )
         status.write_run_status(
             self.out_dir, status.RunState.COMPLETE, checks_planned=self.checks, checks_done=self.done
@@ -165,6 +208,7 @@ class _Run:
             error=error,
         )
         try:
+            self.manifest.write(self.out_dir)
             _write_report(
                 self.out_dir,
                 self.stamp,
@@ -173,25 +217,57 @@ class _Run:
                 self.title,
                 self.subtitle,
                 run_status=self._status_dict(status.RunState.INCOMPLETE, error),
+                provenance=self.manifest.to_dict(),
             )
         except Exception as report_exc:  # noqa: BLE001
             click.echo(f'Could not write the partial report: {type(report_exc).__name__}: {report_exc}', err=True)
         return False
 
 
+def _json_param(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_param(v) for v in value]
+    return value
+
+
+def _new_run_manifest(regression_baseline: bool) -> manifest.RunManifest:
+    """Return a run manifest for the click command being executed, with its parameters as given."""
+    ctx = click.get_current_context(silent=True)
+    command = ctx.command_path if ctx else 'dist-s1-prod-check'
+    params = {k: _json_param(v) for k, v in (ctx.params if ctx else {}).items()}
+    return manifest.RunManifest(
+        command=command,
+        params=params,
+        offline=bool(params.get('offline')),
+        regression_baseline=regression_baseline,
+    )
+
+
 def _run_single_check(
-    out_dir: Path, key: str, title: str, build: Callable[[], tuple[list[dict], dict[str, pd.DataFrame]]]
+    out_dir: Path,
+    key: str,
+    title: str,
+    build: Callable[['_Run'], tuple[list[dict], dict[str, pd.DataFrame]]],
+    regression_baseline: bool = False,
 ) -> None:
     """Run one standalone `check-*` command under a tracked run."""
-    with _Run(out_dir, _stamp(), [key], title) as run:
+    with _Run(out_dir, _stamp(), [key], title, regression_baseline) as run:
         run.stage(key)
-        sections, csvs = build()
+        sections, csvs = build(run)
         run.add(key, sections, csvs)
         run.complete()
 
 
 RUN_ALL_CHECKS = ('duplicates', 'ordering', 'confirmation', 'inputs', 'coverage')
 
+regression_option = click.option(
+    '--regression-baseline',
+    is_flag=True,
+    help='Allow caches adopted with adopt-cache (provenance unverified). For regression runs only, never for a '
+    'production-gate report; the report says so prominently.',
+)
 data_dir_option = click.option('--data-dir', type=click.Path(path_type=Path), default=Path('data'), show_default=True)
 out_dir_option = click.option('--out-dir', type=click.Path(path_type=Path), default=Path('outputs'), show_default=True)
 venue_option = click.option(
@@ -210,8 +286,67 @@ def _rtc_chunks_dir(data_dir: Path, rtc_bbox: tuple | None) -> Path:
     return data_dir / f'{RTC_CHUNKS_DIR}{suffix}'
 
 
-def _write_rtc(df_rtc: gpd.GeoDataFrame, data_dir: Path, chunks_dir: Path) -> None:
-    df_rtc.to_parquet(data_dir / RTC_S1_PARQUET, compression='zstd')
+def _dist_source(venue: str) -> str:
+    return f'{venue} S3 product bucket' if venue in DIST_S1_S3_BUCKETS else f'{venue} CMR'
+
+
+def _rtc_ranges(start: str, stop: str, lookback: bool) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    from dist_s1_prod_check.cmr import lookback_date_ranges
+
+    return lookback_date_ranges(start, stop) if lookback else [(pd.Timestamp(start), pd.Timestamp(stop))]
+
+
+def _write_dist(
+    df_dist: gpd.GeoDataFrame,
+    data_dir: Path,
+    venue: str,
+    start: str,
+    stop: str,
+    bbox: tuple | None,
+    dist_bbox: tuple | None,
+) -> None:
+    """Write the DIST-S1 table and its query receipt (the query just ran to completion)."""
+    path = data_dir / DIST_S1_PARQUET
+    df_dist.to_parquet(path, compression='zstd')
+    manifest.write_table_manifest(
+        path,
+        table='dist_s1',
+        venue=venue,
+        source=_dist_source(venue),
+        start=start,
+        stop=stop,
+        bbox=bbox,
+        query_bbox=dist_bbox,
+        target_tiles=_load_target_tiles(data_dir),
+        lookback_windows=manifest.windows_with_counts([(start, stop)], df_dist.acq_time),
+    )
+
+
+def _write_rtc(
+    df_rtc: gpd.GeoDataFrame,
+    data_dir: Path,
+    chunks_dir: Path,
+    start: str,
+    stop: str,
+    bbox: tuple | None,
+    rtc_bbox: tuple | None,
+    lookback: bool = True,
+) -> None:
+    """Write the RTC-S1 table and its query receipt, recording every window queried (main and lookback)."""
+    path = data_dir / RTC_S1_PARQUET
+    df_rtc.to_parquet(path, compression='zstd')
+    manifest.write_table_manifest(
+        path,
+        table='rtc_s1',
+        venue='PROD',
+        source='PROD CMR',
+        start=start,
+        stop=stop,
+        bbox=bbox,
+        query_bbox=rtc_bbox,
+        target_tiles=_load_target_tiles(data_dir),
+        lookback_windows=manifest.windows_with_counts(_rtc_ranges(start, stop, lookback), df_rtc.acq_dt),
+    )
     shutil.rmtree(chunks_dir, ignore_errors=True)
 
 
@@ -274,15 +409,17 @@ def download_metadata(
     bbox = tuple(bbox) if bbox else None
     dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
 
+    manifest.manifest_path(data_dir / DIST_S1_PARQUET).unlink(missing_ok=True)
     df_dist = cmr.get_dist_s1_table(
         start, stop, bbox=dist_bbox, chunk_days=max(chunk_days, 7), max_workers=workers, venue=venue
     )
-    df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+    _write_dist(df_dist, data_dir, venue, start, stop, bbox, dist_bbox)
     click.echo(f'DIST-S1: {len(df_dist)} granules -> {data_dir / DIST_S1_PARQUET}')
 
     if skip_rtc:
         return
     chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
+    manifest.manifest_path(data_dir / RTC_S1_PARQUET).unlink(missing_ok=True)
     if lookback:
         df_rtc = cmr.get_rtc_s1_table_with_lookback(
             start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers, cache_dir=chunks_dir
@@ -291,8 +428,66 @@ def download_metadata(
         df_rtc = cmr.get_rtc_s1_table(
             start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers, cache_dir=chunks_dir
         )
-    _write_rtc(df_rtc, data_dir, chunks_dir)
+    _write_rtc(df_rtc, data_dir, chunks_dir, start, stop, bbox, rtc_bbox, lookback)
     click.echo(f'RTC-S1: {len(df_rtc)} granules -> {data_dir / RTC_S1_PARQUET}')
+
+
+@cli.command()
+@click.option('--start', required=True, help='--start of the run that built the cache.')
+@click.option('--stop', required=True, help='--stop of the run that built the cache.')
+@click.option('--bbox', type=float, nargs=4, default=None, help='--bbox of the run that built the cache, if any.')
+@click.option(
+    '--lookback/--no-lookback',
+    default=True,
+    show_default=True,
+    help='Whether the RTC-S1 table was built with the baseline lookback windows (run-all always does).',
+)
+@click.option(
+    '--rtc-source', default='PROD CMR', show_default=True, help='Where the RTC-S1 table came from, as recorded.'
+)
+@venue_option
+@data_dir_option
+def adopt_cache(
+    start: str, stop: str, bbox: tuple, lookback: bool, rtc_source: str, venue: str, data_dir: Path
+) -> None:
+    """Write manifests for a cache built before manifests existed, from the arguments that built it.
+
+    The result is `adopted_unverified`: it records what you claim the cache holds, not what was queried or that
+    the query finished. Adopted caches are accepted only with --regression-baseline and never back a
+    production-gate report.
+    """
+    bbox = tuple(bbox) if bbox else None
+    cached_venue = _venue_of(data_dir)
+    if cached_venue and cached_venue != venue:
+        raise click.ClickException(f'{data_dir} holds {cached_venue} data, not {venue}.')
+    dist_path, rtc_path = data_dir / DIST_S1_PARQUET, data_dir / RTC_S1_PARQUET
+    if not dist_path.exists():
+        raise click.ClickException(f'{dist_path} not found; nothing to adopt.')
+    tiles = _load_target_tiles(data_dir)
+    common = {'start': start, 'stop': stop, 'bbox': bbox, 'target_tiles': tiles}
+    common |= {'provenance': manifest.ADOPTED_UNVERIFIED}
+    df_dist = pd.read_parquet(dist_path, columns=['acq_time'])
+    m = manifest.write_table_manifest(
+        dist_path,
+        table='dist_s1',
+        venue=venue,
+        source=_dist_source(venue),
+        lookback_windows=manifest.windows_with_counts([(start, stop)], df_dist.acq_time),
+        **common,
+    )
+    click.echo(f'Adopted {dist_path} ({m.n_rows} rows, provenance {m.provenance})')
+    if rtc_path.exists():
+        df_rtc = pd.read_parquet(rtc_path, columns=['acq_dt'])
+        m = manifest.write_table_manifest(
+            rtc_path,
+            table='rtc_s1',
+            venue='PROD',
+            source=rtc_source,
+            lookback_windows=manifest.windows_with_counts(_rtc_ranges(start, stop, lookback), df_rtc.acq_dt),
+            **common,
+        )
+        click.echo(f'Adopted {rtc_path} ({m.n_rows} rows, {len(m.lookback_windows)} query windows claimed complete)')
+    click.echo('Adopted caches are usable only with --regression-baseline.')
 
 
 tag_url_template_option = click.option(
@@ -572,28 +767,34 @@ def _coverage_section(
 
 
 @cli.command()
+@regression_option
 @data_dir_option
 @out_dir_option
-def check_duplicates(data_dir: Path, out_dir: Path) -> None:
+def check_duplicates(data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
     """Check for duplicated DIST-S1 products (check 2)."""
     _run_single_check(
         out_dir,
         'duplicates',
         'DIST-S1 duplicates',
-        lambda: _duplicates_section(_load_dist(data_dir), _wkt_by_tile(_all_tile_geoms())),
+        lambda run: _duplicates_section(_load_dist_checked(data_dir, run), _wkt_by_tile(_all_tile_geoms())),
+        regression_baseline,
     )
 
 
 @cli.command()
+@regression_option
 @data_dir_option
 @out_dir_option
-def check_ordering(data_dir: Path, out_dir: Path) -> None:
+def check_ordering(data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
     """Check processing order matches acquisition order (check 3)."""
     _run_single_check(
         out_dir,
         'ordering',
         'DIST-S1 processing order',
-        lambda: _ordering_section(checks.deduplicate_products(_load_dist(data_dir)), _wkt_by_tile(_all_tile_geoms())),
+        lambda run: _ordering_section(
+            checks.deduplicate_products(_load_dist_checked(data_dir, run)), _wkt_by_tile(_all_tile_geoms())
+        ),
+        regression_baseline,
     )
 
 
@@ -601,20 +802,22 @@ def check_ordering(data_dir: Path, out_dir: Path) -> None:
 @click.option(
     '--expect-none-at-start', is_flag=True, help='Require the first product per tile to have no prior (mission start).'
 )
+@regression_option
 @data_dir_option
 @out_dir_option
-def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path) -> None:
+def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
     """Check the confirmation chain via prior product tags (check 4)."""
     _run_single_check(
         out_dir,
         'confirmation',
         'DIST-S1 confirmation chain',
-        lambda: _confirmation_section(
-            checks.deduplicate_products(_load_dist(data_dir)),
+        lambda run: _confirmation_section(
+            checks.deduplicate_products(_load_dist_checked(data_dir, run)),
             _load_tags(data_dir),
             expect_none_at_start,
             _wkt_by_tile(_all_tile_geoms()),
         ),
+        regression_baseline,
     )
 
 
@@ -623,18 +826,21 @@ def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
 @click.option('--seed', type=int, default=42, show_default=True)
 @click.option('--workers', type=int, default=8, show_default=True)
+@regression_option
 @data_dir_option
 @out_dir_option
-def check_inputs(mode: str, sample: int, seed: int, workers: int, data_dir: Path, out_dir: Path) -> None:
+def check_inputs(
+    mode: str, sample: int, seed: int, workers: int, data_dir: Path, out_dir: Path, regression_baseline: bool
+) -> None:
     """Check product inputs against re-enumerated expected inputs (check 5)."""
 
-    def build() -> tuple[list[dict], dict[str, pd.DataFrame]]:
-        df_dist = _load_dist(data_dir)
+    def build(run: _Run) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+        df_dist = _load_dist_checked(data_dir, run)
         df_tags = _load_tags(data_dir)
         df_tags = df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)]
         if sample:
             df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
-        df_frame = _build_rtc_frame(_load_rtc(data_dir), data_dir) if mode == 'offline' else None
+        df_frame = _build_rtc_frame(_load_rtc_checked(data_dir, run)[0], data_dir) if mode == 'offline' else None
         return _inputs_section(
             df_tags,
             df_frame,
@@ -644,27 +850,29 @@ def check_inputs(mode: str, sample: int, seed: int, workers: int, data_dir: Path
             checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
         )
 
-    _run_single_check(out_dir, 'inputs', 'DIST-S1 product inputs', build)
+    _run_single_check(out_dir, 'inputs', 'DIST-S1 product inputs', build, regression_baseline)
 
 
 @cli.command()
 @click.option('--start', required=True)
 @click.option('--stop', required=True)
+@regression_option
 @data_dir_option
 @out_dir_option
-def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None:
+def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
     """Check all triggerable DIST-S1 products exist given available RTC-S1 inputs (check 6)."""
     _run_single_check(
         out_dir,
         'coverage',
         'DIST-S1 coverage',
-        lambda: _coverage_section(
-            checks.deduplicate_products(_load_dist(data_dir)),
-            _build_rtc_frame(_load_rtc(data_dir), data_dir),
+        lambda run: _coverage_section(
+            checks.deduplicate_products(_load_dist_checked(data_dir, run)),
+            _build_rtc_frame(_load_rtc_checked(data_dir, run, start, stop)[0], data_dir),
             start,
             stop,
             _wkt_by_tile(_all_tile_geoms()),
         ),
+        regression_baseline,
     )
 
 
@@ -702,6 +910,7 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path) -> None
 @click.option('--processing-stop', default=None, help='Only check DIST-S1 products processed before this time.')
 @tag_url_template_option
 @venue_option
+@regression_option
 @data_dir_option
 @out_dir_option
 def run_all(
@@ -720,13 +929,14 @@ def run_all(
     processing_stop: str | None,
     tag_url_template: str | None,
     venue: str,
+    regression_baseline: bool,
     data_dir: Path,
     out_dir: Path,
 ) -> None:
     """Run checks 1-6 end to end: download metadata, fetch tags, run every check, write CSVs and an HTML report."""
     from dist_s1_prod_check import cmr
 
-    with _Run(out_dir, _stamp(), list(RUN_ALL_CHECKS), 'DIST-S1 Production Check') as run:
+    with _Run(out_dir, _stamp(), list(RUN_ALL_CHECKS), 'DIST-S1 Production Check', regression_baseline) as run:
         _check_venue(data_dir, venue)
         bbox = tuple(bbox) if bbox else None
 
@@ -734,20 +944,29 @@ def run_all(
         need_rtc = refresh or not (data_dir / RTC_S1_PARQUET).exists()
         if need_dist or need_rtc:
             (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
+            for name, needed in ((DIST_S1_PARQUET, need_dist), (RTC_S1_PARQUET, need_rtc)):
+                if needed:
+                    manifest.manifest_path(data_dir / name).unlink(missing_ok=True)
             dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
             chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
             if refresh:
                 shutil.rmtree(chunks_dir, ignore_errors=True)
             if need_dist:
                 df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
-                df_dist.to_parquet(data_dir / DIST_S1_PARQUET, compression='zstd')
+                _write_dist(df_dist, data_dir, venue, start, stop, bbox, dist_bbox)
             if need_rtc:
                 df_rtc = cmr.get_rtc_s1_table_with_lookback(
                     start, stop, bbox=rtc_bbox, max_workers=cmr_workers, cache_dir=chunks_dir
                 )
-                _write_rtc(df_rtc, data_dir, chunks_dir)
+                _write_rtc(df_rtc, data_dir, chunks_dir, start, stop, bbox, rtc_bbox)
                 del df_rtc
-        df_dist = _load_dist(data_dir)
+        request = manifest.CacheRequest(venue, start, stop, bbox, check_bbox=True)
+        df_dist, m_dist = _load_cached(data_dir, DIST_S1_PARQUET, run, request)
+        if manifest.strictly_inside(m_dist, start, stop):
+            acq = pd.to_datetime(df_dist.acq_time, utc=True)
+            in_window = (acq >= manifest._utc(start)) & (acq < manifest._utc(stop))
+            click.echo(f'Window filter kept {int(in_window.sum())} of {len(df_dist)} cached DIST-S1 products')
+            df_dist = df_dist[in_window].reset_index(drop=True)
         if processing_start or processing_stop:
             df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
         if sample_tiles:
@@ -756,7 +975,9 @@ def run_all(
             df_dist = df_dist[df_dist.mgrs_tile_id.isin(keep)].reset_index(drop=True)
             click.echo(f'Sampled {len(keep)} of {len(all_tiles)} tiles')
         click.echo(f'DIST-S1 products: {len(df_dist)}')
-        df_rtc = _load_rtc(data_dir)
+        df_rtc, _ = _load_cached(
+            data_dir, RTC_S1_PARQUET, run, manifest.CacheRequest('PROD', start, stop, bbox, check_bbox=True)
+        )
         click.echo(f'RTC-S1 granules: {len(df_rtc)}')
         from dist_s1_prod_check.cmr import build_rtc_input_frame
 
@@ -783,6 +1004,7 @@ def run_all(
             df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
         )
         df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
+        _record_file(run, data_dir / TAGS_PARQUET)
 
         wkt_map = _wkt_by_tile(_all_tile_geoms())
         builds = {
@@ -802,4 +1024,5 @@ def run_all(
         for key in RUN_ALL_CHECKS:
             run.stage(key)
             run.add(key, *builds[key]())
+        _record_file(run, data_dir / INPUTS_CHECKPOINT_PARQUET)
         run.complete()

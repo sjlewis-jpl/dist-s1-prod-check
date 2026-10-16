@@ -127,10 +127,9 @@ def _all_output_text(out_dir: Path) -> str:
 
 
 # aa2014f: report titled '2026-02-01 to 2026-03-01' written over the January products, then exit 1 (empty coverage).
-@pytest.mark.xfail(strict=True, reason='F01: January cache reused for a February run; header shows February')
 def test_f01_cache_window_mismatch_refused(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
     dist, rtc, tag_df = _world()
-    seed_data_dir(tmp_data_dir, dist, rtc, tag_df)
+    seed_data_dir(tmp_data_dir, dist, rtc, tag_df, window=('2026-01-01', '2026-02-01'))
     out_dir = tmp_path / 'out'
     result = _run_all(cli_runner, tmp_data_dir, out_dir, '--start', '2026-02-01', '--stop', '2026-03-01')
     leaked = [oid for oid in dist.opera_id if oid in _all_output_text(out_dir)]
@@ -141,7 +140,6 @@ def test_f01_cache_window_mismatch_refused(tmp_path: Path, tmp_data_dir: Path, c
 
 
 # aa2014f: exit 0; report subtitle 'over (10.0, 45.0, 11.0, 46.0)' while every row is tile 10SGC from the cache.
-@pytest.mark.xfail(strict=True, reason='F01: cache built for one AOI reused for a different --bbox')
 def test_f01_cache_bbox_mismatch_refused(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
     dist, rtc, tag_df = _world()
     seed_data_dir(tmp_data_dir, dist, rtc, tag_df, target_tiles=[TILE])

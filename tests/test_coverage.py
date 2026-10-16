@@ -130,7 +130,6 @@ def _query_windows(complete: list[bool] | None = None, n_rows: int = 10) -> list
 
 
 # aa2014f: ModuleNotFoundError: No module named 'dist_s1_prod_check.manifest' (Phase 1, Task 1.4)
-@pytest.mark.xfail(strict=True, reason='F02: lookback completeness must come from per-window manifest records')
 @pytest.mark.parametrize(
     ('case', 'expected'),
     [('all_windows_complete', True), ('one_window_missing', False), ('one_window_interrupted', False)],
