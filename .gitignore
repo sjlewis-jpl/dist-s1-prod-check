@@ -35,3 +35,4 @@ outputs*/
 claude/
 
 __pycache__/
+!tests/data/

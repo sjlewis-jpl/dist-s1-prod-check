@@ -1,0 +1,49 @@
+{
+  "source_cache": "hardening_review/frozen/uat",
+  "source_sha256": {
+    "dist_s1_products.parquet": "fb7d93db2886ff54d5a3cb5d68bdeb4f8d6826403080e3bd600de95a22a3ff68",
+    "dist_s1_tags.parquet": "718c68f87ead0aa6fd409c624fc9f6cd54abfd681057d47959dd2ced9823cb68",
+    "rtc_s1_products.parquet": "b53285199f383876faa2600079365b28bc56dc9e18f78c718a0ed10d6399a542",
+    "venue.txt": "2c324cd4caa36e321d6c10fe80bb291ede0a364b7a47aae881898b927d2ff403"
+  },
+  "tiles": {
+    "01UCT": "pop1 confirmation failure (prior names the wrong product); UTM zone 1 next to the antimeridian.",
+    "01WCQ": "No DIST-S1 product in either venue: coverage rows only, all \"no baseline imagery\".",
+    "11SLT": "Inside the pop1 AOI baseline bbox (-120 34 -118 36), so the AOI and subset runs overlap.",
+    "11SNA": "UAT tag read error (HTTP 404) on one product; also coverage missing, no-baseline and pre-input issues.",
+    "12SXF": "Burst ID mismatch, post RTC expected-but-not-found and pre issues in both venues.",
+    "13TEG": "Review R2 (pop1): confirmed-OK product whose prior names a superseded version; pop1 duplicates.",
+    "18STD": "Review R3 (pop1): May products processed before their predecessors, hidden by the reprocessed exclusion in ordering; 7 pop1 duplicate rows.",
+    "21HUU": "Southern hemisphere; burst ID mismatch and post/pre input issues in both venues.",
+    "22WEA": "pop1 acquisition with 3 versions; pre-input issues in both venues.",
+    "24XWL": "Second polar double-match tile: 10 coverage rows share a matched product (both); F06.",
+    "27XVK": "Polar (Greenland) tile with double matches: 12 coverage rows share a matched product (both); F06.",
+    "33VWH": "Control tile: no flagged row in any check in either venue (high latitude, many products).",
+    "34UDV": "UAT tag read error (HTTP 404); UAT duplicates; 25 UAT coverage-missing passes.",
+    "34WDA": "Largest UAT coverage-missing tile (52 passes).",
+    "34WDC": "Largest pop1 coverage-missing tile (29 passes).",
+    "35WPN": "Pre RTC IDs found but not expected (both venues); no-baseline coverage rows.",
+    "37MBV": "UAT acquisition with 3 versions (duplicates); no-baseline coverage rows.",
+    "47QKB": "Control tile: no flagged row in any check in either venue (tropics).",
+    "56WMT": "Review R3 (pop1): 3 hidden out-of-order cases; acquisitions with 3 versions (13 pop1 duplicate rows).",
+    "60GTA": "UTM zone 60, southern hemisphere, next to the antimeridian; 13 pop1 coverage-missing passes."
+  },
+  "n_burst_ids": 1682,
+  "rows": {
+    "dist_s1_products.parquet": 1084,
+    "dist_s1_tags.parquet": 582,
+    "tags_with_error": 2,
+    "rtc_s1_products.parquet": 34459
+  },
+  "rtc_acq_dt_range": [
+    "2022-11-03 04:40:55+00:00",
+    "2026-02-28 23:06:16+00:00"
+  ],
+  "output_sha256": {
+    "dist_s1_products.parquet": "d6decebc3d652f9b268ef7aedce882fff64d1221cf4584eb6285e2279dcc031d",
+    "dist_s1_tags.parquet": "b12a1aacd48f1b86f0b7102a20d05e5de0b005066416189f876f47c372787a04",
+    "rtc_s1_products.parquet": "e1194737870b1be757532dc8265b08f1abd0fa09f8b7879a9f77341ed89fa79a",
+    "venue.txt": "2c324cd4caa36e321d6c10fe80bb291ede0a364b7a47aae881898b927d2ff403",
+    "target_mgrs_tiles.txt": "aa62f13ebb39a572f8f822da3784475e7f6bdcd0b2dad476e43f8b6e5998317a"
+  }
+}
