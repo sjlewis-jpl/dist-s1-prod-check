@@ -128,3 +128,24 @@ def test_f16_chunk_checkpoint_without_manifest_is_not_reused(tmp_path: Path, mon
 
     assert len(queries) == 1, f'CMR queried {len(queries)} times; the manifest-less checkpoint was reused'
     assert sorted(df.opera_id) == sorted(fresh_ids)
+
+
+# c27b56b: the +02:00 offset was dropped without conversion, so the window started 2 h late and the 23:30 UTC
+# product acquired inside it was lost (and day 2026-01-01 was never listed).
+def test_f28_s3_listing_window_converted_to_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    from factories import dist_id
+
+    acqs = {'2026/01/01': ['2026-01-01T21:30:00', '2026-01-01T23:30:00'], '2026/01/02': ['2026-01-02T05:00:00']}
+    listed: list[str] = []
+
+    def fake_list(bucket: str, prefix: str) -> list[str]:
+        day = prefix.removeprefix('products/DIST_S1/').rstrip('/')
+        listed.append(day)
+        ids = [dist_id('10SGC', a, '2026-01-03T00:00:00') for a in acqs.get(day, [])]
+        return [f'{prefix}{i}/' for i in ids]
+
+    monkeypatch.setattr(cmr, '_list_s3_prefixes', fake_list)
+    df = cmr._list_dist_s1_s3('2026-01-02T00:00:00+02:00', '2026-01-03', 'bucket', max_workers=1)
+
+    assert '2026/01/01' in listed
+    assert sorted(df.acq_time.dt.strftime('%H:%M')) == ['05:00', '23:30']

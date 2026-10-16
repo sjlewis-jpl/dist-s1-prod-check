@@ -384,3 +384,32 @@ def test_f17_absent_prior_key_fails(
     failures = _csv(out_dir, 'confirmation_failures')
     assert list(failures.get('opera_id', [])) == [row.opera_id], 'missing prior tag passed the chain check'
     assert 'prior tag absent' in failures.reason.iloc[0]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# F28: a missing venue.txt next to an existing cache defaulted to PROD.
+
+
+# c27b56b: exit 0; the cache was taken to be PROD because venue.txt was missing.
+@pytest.mark.parametrize('command', ['run-all', 'check-duplicates'])
+def test_f28_missing_venue_file_with_cache_refused(
+    command: str, tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner
+) -> None:
+    seed_data_dir(tmp_data_dir, *_world(), target_tiles=[TILE])
+    (tmp_data_dir / 'venue.txt').unlink()
+    out_dir = tmp_path / 'out'
+    if command == 'run-all':
+        result = _run_all(cli_runner, tmp_data_dir, out_dir)
+    else:
+        result = _invoke(cli_runner, command, '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir))
+    assert result.exit_code != 0
+    assert 'venue.txt' in result.output, result.output
+    assert not (tmp_data_dir / 'venue.txt').exists(), 'the guard must not write a venue it was not told'
+
+
+def test_f28_adopt_cache_writes_missing_venue_file(tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    seed_data_dir(tmp_data_dir, *_world(), target_tiles=[TILE])
+    (tmp_data_dir / 'venue.txt').unlink()
+    result = _invoke(cli_runner, 'adopt-cache', '--venue', 'UAT', *JANUARY, '--data-dir', str(tmp_data_dir))
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    assert (tmp_data_dir / 'venue.txt').read_text().strip() == 'UAT'

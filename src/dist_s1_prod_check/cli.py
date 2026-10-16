@@ -38,6 +38,21 @@ def _venue_of(data_dir: Path) -> str | None:
     return marker.read_text().strip() if marker.exists() else None
 
 
+def _has_cache(data_dir: Path) -> bool:
+    return any((data_dir / name).exists() for name in (DIST_S1_PARQUET, TAGS_PARQUET, INPUTS_CHECKPOINT_PARQUET))
+
+
+def _require_venue(data_dir: Path) -> str | None:
+    """Venue recorded for a data dir; refuses a cache with no `venue.txt` instead of assuming PROD (F28)."""
+    venue = _venue_of(data_dir)
+    if venue is None and _has_cache(data_dir):
+        raise click.ClickException(
+            f'{data_dir} holds cached tables but no {VENUE_FILE}, so their venue is unknown (PROD and UAT product '
+            f'ids can collide). Re-download with --refresh, or run `adopt-cache --venue VENUE` to record it.'
+        )
+    return venue
+
+
 def _load_cached(
     data_dir: Path, filename: str, run: '_Run', request: manifest.CacheRequest
 ) -> tuple[gpd.GeoDataFrame, manifest.TableManifest]:
@@ -72,7 +87,9 @@ def _version_note(run: '_Run') -> str:
 
 def _load_dist_checked(data_dir: Path, run: '_Run', product_versions: str) -> gpd.GeoDataFrame:
     """DIST-S1 table for a standalone check command (no window or AOI to match), version-filtered."""
-    df, _ = _load_cached(data_dir, DIST_S1_PARQUET, run, manifest.CacheRequest(venue=_venue_of(data_dir) or 'PROD'))
+    df, _ = _load_cached(
+        data_dir, DIST_S1_PARQUET, run, manifest.CacheRequest(venue=_require_venue(data_dir) or 'PROD')
+    )
     df = _filter_versions(df, product_versions, run)
     run.subtitle = _version_note(run).removeprefix(' - ')
     return df
@@ -420,13 +437,11 @@ def _filter_processing_time(
 
 def _check_venue(data_dir: Path, venue: str) -> None:
     """Refuse to reuse a data dir whose cached tables came from another venue (PROD/UAT product ids can collide)."""
-    marker = data_dir / VENUE_FILE
-    has_cache = any((data_dir / name).exists() for name in (DIST_S1_PARQUET, TAGS_PARQUET, INPUTS_CHECKPOINT_PARQUET))
-    cached = marker.read_text().strip() if marker.exists() else ('PROD' if has_cache else venue)
+    cached = _require_venue(data_dir) or venue
     if cached != venue:
         raise click.ClickException(f'{data_dir} holds {cached} data; use a separate --data-dir for {venue}.')
     data_dir.mkdir(parents=True, exist_ok=True)
-    marker.write_text(f'{venue}\n')
+    (data_dir / VENUE_FILE).write_text(f'{venue}\n')
 
 
 @click.group()
@@ -521,6 +536,10 @@ def adopt_cache(
     dist_path, rtc_path = data_dir / DIST_S1_PARQUET, data_dir / RTC_S1_PARQUET
     if not dist_path.exists():
         raise click.ClickException(f'{dist_path} not found; nothing to adopt.')
+    if cached_venue is None:
+        # Adopting asserts the venue, as it asserts the window and AOI.
+        (data_dir / VENUE_FILE).write_text(f'{venue}\n')
+        click.echo(f'Recorded venue {venue} in {data_dir / VENUE_FILE} (asserted, not verified)')
     tiles = _load_target_tiles(data_dir)
     common = {'start': start, 'stop': stop, 'bbox': bbox, 'target_tiles': tiles}
     common |= {'provenance': manifest.ADOPTED_UNVERIFIED}

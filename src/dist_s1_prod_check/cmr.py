@@ -48,6 +48,12 @@ def get_edl_token(venue: str = 'PROD') -> str:
     return auth.token['access_token']
 
 
+def _utc_naive(t: DateLike) -> pd.Timestamp:
+    """Timestamp in UTC without an offset; a naive input is taken to be UTC already."""
+    ts = pd.Timestamp(t)
+    return ts if ts.tz is None else ts.tz_convert('UTC').tz_localize(None)
+
+
 def _fmt_dt(t: DateLike) -> str:
     ts = pd.Timestamp(t)
     ts = ts.tz_localize('UTC') if ts.tz is None else ts.tz_convert('UTC')
@@ -322,7 +328,8 @@ def _list_s3_prefixes(bucket: str, prefix: str) -> list[str]:
 
 def _list_dist_s1_s3(start_time: DateLike, stop_time: DateLike, bucket: str, max_workers: int = 8) -> pd.DataFrame:
     """DIST-S1 products acquired in [start_time, stop_time), from the bucket's per-acquisition-day product folders."""
-    start, stop = pd.Timestamp(start_time), pd.Timestamp(stop_time)
+    # Product ids carry UTC times without an offset: convert the window to UTC before dropping its offset (F28).
+    start, stop = (_utc_naive(t) for t in (start_time, stop_time))
     days = pd.date_range(start.normalize(), (stop - pd.Timedelta(1, 'ns')).normalize(), freq='D')
     base = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
 
@@ -349,7 +356,7 @@ def _list_dist_s1_s3(start_time: DateLike, stop_time: DateLike, bucket: str, max
     df = pd.DataFrame([r for day in per_day for r in day])
     if df.empty:
         return df
-    in_window = (df.acq_time >= start.tz_localize(None)) & (df.acq_time < stop.tz_localize(None))
+    in_window = (df.acq_time >= start) & (df.acq_time < stop)
     return df[in_window].reset_index(drop=True)
 
 
