@@ -5,7 +5,7 @@ from pathlib import Path
 import geopandas as gpd
 import pandas as pd
 from dist_s1_enumerator import enumerate_dist_s1_products, enumerate_one_dist_s1_product
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
 from dist_s1_prod_check.constants import (
@@ -16,6 +16,7 @@ from dist_s1_prod_check.constants import (
     POST_DATE_BUFFER_SECONDS,
 )
 from dist_s1_prod_check.ids import get_acq_timestamp, get_burst_id, get_opera_id_trunc, get_track_number
+from dist_s1_prod_check.network import OfflineError, network_allowed
 
 
 N_S1_TRACKS = 175
@@ -323,8 +324,14 @@ def check_inputs_offline(
     return df[df.opera_id.isin(requested_opera)].reset_index(drop=True)
 
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=60), reraise=True)
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=60),
+    retry=retry_if_not_exception_type(OfflineError),
+    reraise=True,
+)
 def _enumerate_one(mgrs_tile_id: str, track_number: int, post_date: str) -> pd.DataFrame:
+    network_allowed('online inputs mode (enumerator queries ASF)')
     df = enumerate_one_dist_s1_product(
         mgrs_tile_id=mgrs_tile_id,
         track_number=track_number,

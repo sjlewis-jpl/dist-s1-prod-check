@@ -18,7 +18,7 @@ from dist_s1_enumerator.mgrs_burst_data import (
     get_mgrs_tiles_overlapping_geometry,
 )
 from shapely.geometry import box
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_random_exponential
 from tqdm import tqdm
 
 from dist_s1_prod_check.constants import (
@@ -36,6 +36,7 @@ from dist_s1_prod_check.constants import (
     RTC_S1_CONCEPT_ID,
 )
 from dist_s1_prod_check.ids import get_opera_id_trunc, get_track_number
+from dist_s1_prod_check.network import OfflineError, network_allowed
 
 
 DateLike = str | datetime | pd.Timestamp
@@ -71,6 +72,7 @@ def search_granules(
     cmr_url: str = CMR_GRANULES_URL,
 ) -> list[dict]:
     """Search CMR granules; with `parse_fn`, each page is parsed as it arrives so raw UMM JSON is never accumulated."""
+    network_allowed('a CMR granule search (metadata download or chunk re-query)')
     params: dict = {
         'collection_concept_id': collection_concept_id,
         'temporal': f'{_fmt_dt(start_time)},{_fmt_dt(stop_time)}',
@@ -294,9 +296,15 @@ def get_dist_s1_table(
     return df.sort_values(['mgrs_tile_id', 'acq_time']).reset_index(drop=True)
 
 
-@retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_random_exponential(multiplier=1, max=60),
+    retry=retry_if_not_exception_type(OfflineError),
+    reraise=True,
+)
 def _list_s3_prefixes(bucket: str, prefix: str) -> list[str]:
     """Sub-prefixes ("directories") directly under `prefix`, via anonymous ListObjectsV2."""
+    network_allowed(f'listing s3://{bucket}/{prefix}')
     url = f'https://{bucket}.s3.{DIST_S1_S3_REGION}.amazonaws.com/'
     ns = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
     params = {'list-type': '2', 'prefix': prefix, 'delimiter': '/'}

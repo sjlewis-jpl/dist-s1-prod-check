@@ -3,7 +3,6 @@
 See ``tests/data/README.md`` for the subset's provenance and for the tag-retry workaround used here.
 """
 
-import functools
 import json
 import shutil
 import socket
@@ -15,7 +14,7 @@ import pandas as pd
 import pytest
 from click.testing import CliRunner
 
-from dist_s1_prod_check import report, tags
+from dist_s1_prod_check import report
 from dist_s1_prod_check.cli import cli
 
 
@@ -143,9 +142,6 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
     assert adopted.exit_code == 0, adopted.output
 
     attempts = _install_network_blocks(monkeypatch)
-    # aa2014f retries cached tag rows holding a read error on every run (tags.fetch_tags_table, retry_errors=True),
-    # which is a network attempt. Replay the cached rows unchanged instead; --offline (Task 1.7) replaces this.
-    monkeypatch.setattr(tags, 'fetch_tags_table', functools.partial(tags.fetch_tags_table, retry_errors=False))
     sections: list[dict] = []
     write_html = report.write_html_report
 
@@ -155,7 +151,16 @@ def test_subset_baseline(venue: str, tmp_path: Path, cli_runner: CliRunner, monk
 
     monkeypatch.setattr(report, 'write_html_report', _capture)
 
-    args = ['run-all', *VENUE_ARGS[venue], '--regression-baseline', '--workers', '1', '--inputs-workers', '1']
+    args = [
+        'run-all',
+        *VENUE_ARGS[venue],
+        '--offline',
+        '--regression-baseline',
+        '--workers',
+        '1',
+        '--inputs-workers',
+        '1',
+    ]
     result = cli_runner.invoke(cli, [*args, '--data-dir', str(data_dir), '--out-dir', str(out_dir)])
     assert result.exit_code == 0, f'{result.output}\n{result.exception!r}'
     assert attempts == []

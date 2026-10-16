@@ -7,7 +7,7 @@ import click
 import geopandas as gpd
 import pandas as pd
 
-from dist_s1_prod_check import checks, coverage, inputs, manifest, report, status, tags
+from dist_s1_prod_check import checks, coverage, inputs, manifest, network, report, status, tags
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
     DIST_S1_S3_BUCKETS,
@@ -297,6 +297,20 @@ def _run_single_check(
 
 RUN_ALL_CHECKS = ('duplicates', 'ordering', 'confirmation', 'inputs', 'coverage')
 
+
+def _set_offline(ctx: click.Context, param: click.Parameter, value: bool) -> bool:
+    network.set_offline(value)
+    return value
+
+
+offline_option = click.option(
+    '--offline',
+    is_flag=True,
+    callback=_set_offline,
+    help='Use cached data only. Any step that needs the network (metadata download, chunk re-query, tag fetch for '
+    'a product with no cached row, online inputs mode) fails with an error naming it; cached tag-read errors are '
+    'kept as UNKNOWN, not retried.',
+)
 product_versions_option = click.option(
     '--product-versions',
     default='v1.0',
@@ -431,6 +445,7 @@ def cli() -> None:
 @click.option('--chunk-days', type=int, default=2, show_default=True)
 @click.option('--workers', type=int, default=8, show_default=True)
 @venue_option
+@offline_option
 @data_dir_option
 def download_metadata(
     start: str,
@@ -441,11 +456,13 @@ def download_metadata(
     chunk_days: int,
     workers: int,
     venue: str,
+    offline: bool,
     data_dir: Path,
 ) -> None:
     """Download DIST-S1 and RTC-S1 granule metadata from CMR into geoparquet tables (check 1)."""
     from dist_s1_prod_check import cmr
 
+    network.network_allowed('download-metadata')
     _check_venue(data_dir, venue)
     bbox = tuple(bbox) if bbox else None
     dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
@@ -546,9 +563,16 @@ tag_url_template_option = click.option(
 @click.option('--seed', type=int, default=42, show_default=True)
 @tag_url_template_option
 @product_versions_option
+@offline_option
 @data_dir_option
 def fetch_tags(
-    workers: int, sample: int, seed: int, tag_url_template: str | None, product_versions: str, data_dir: Path
+    workers: int,
+    sample: int,
+    seed: int,
+    tag_url_template: str | None,
+    product_versions: str,
+    offline: bool,
+    data_dir: Path,
 ) -> None:
     """Fetch product GeoTIFF tags (inputs, prior product) from the DAAC; resumable."""
     df_dist = checks.deduplicate_products(_filter_versions(_load_dist(data_dir), product_versions, None))
@@ -813,11 +837,14 @@ def _coverage_section(
 
 
 @cli.command()
+@offline_option
 @product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
-def check_duplicates(data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str) -> None:
+def check_duplicates(
+    data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str, offline: bool
+) -> None:
     """Check for duplicated DIST-S1 products (check 2)."""
     _run_single_check(
         out_dir,
@@ -831,11 +858,14 @@ def check_duplicates(data_dir: Path, out_dir: Path, regression_baseline: bool, p
 
 
 @cli.command()
+@offline_option
 @product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
-def check_ordering(data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str) -> None:
+def check_ordering(
+    data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str, offline: bool
+) -> None:
     """Check processing order matches acquisition order (check 3)."""
     _run_single_check(
         out_dir,
@@ -853,6 +883,7 @@ def check_ordering(data_dir: Path, out_dir: Path, regression_baseline: bool, pro
 @click.option(
     '--expect-none-at-start', is_flag=True, help='Require the first product per tile to have no prior (mission start).'
 )
+@offline_option
 @product_versions_option
 @regression_option
 @data_dir_option
@@ -880,6 +911,7 @@ def check_confirmation(
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
 @click.option('--seed', type=int, default=42, show_default=True)
 @click.option('--workers', type=int, default=8, show_default=True)
+@offline_option
 @product_versions_option
 @regression_option
 @data_dir_option
@@ -893,8 +925,11 @@ def check_inputs(
     out_dir: Path,
     regression_baseline: bool,
     product_versions: str,
+    offline: bool,
 ) -> None:
     """Check product inputs against re-enumerated expected inputs (check 5)."""
+    if mode == 'online':
+        network.network_allowed('online inputs mode')
 
     def build(run: _Run) -> tuple[list[dict], dict[str, pd.DataFrame]]:
         df_dist = _load_dist_checked(data_dir, run, product_versions)
@@ -938,6 +973,7 @@ def _check_coverage_standalone(
 @cli.command()
 @click.option('--start', required=True)
 @click.option('--stop', required=True)
+@offline_option
 @product_versions_option
 @regression_option
 @data_dir_option
@@ -989,6 +1025,7 @@ def check_coverage(
 @click.option('--processing-stop', default=None, help='Only check DIST-S1 products processed before this time.')
 @tag_url_template_option
 @venue_option
+@offline_option
 @product_versions_option
 @regression_option
 @data_dir_option
@@ -1011,6 +1048,7 @@ def run_all(
     venue: str,
     regression_baseline: bool,
     product_versions: str,
+    offline: bool,
     data_dir: Path,
     out_dir: Path,
 ) -> None:
@@ -1024,6 +1062,10 @@ def run_all(
         need_dist = refresh or not (data_dir / DIST_S1_PARQUET).exists()
         need_rtc = refresh or not (data_dir / RTC_S1_PARQUET).exists()
         if need_dist or need_rtc:
+            missing = [n for n, needed in ((DIST_S1_PARQUET, need_dist), (RTC_S1_PARQUET, need_rtc)) if needed]
+            network.network_allowed(
+                f'metadata download ({"--refresh" if refresh else "missing " + ", ".join(missing)})'
+            )
             (data_dir / INPUTS_CHECKPOINT_PARQUET).unlink(missing_ok=True)
             for name, needed in ((DIST_S1_PARQUET, need_dist), (RTC_S1_PARQUET, need_rtc)):
                 if needed:

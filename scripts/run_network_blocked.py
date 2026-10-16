@@ -3,7 +3,7 @@
 Usage::
 
     run_network_blocked.py <dist-s1-prod-check args...>
-    run_network_blocked.py --repro-baseline NAME [--repro-tag TAG] [--drop-inputs-checkpoint] [extra args...]
+    run_network_blocked.py --repro-baseline NAME [--repro-tag TAG] [--drop-inputs-checkpoint] [--adopt] [extra args...]
 
 The first form passes the arguments straight to ``dist_s1_prod_check.cli.cli``. The second form reproduces a
 baseline from ``docs/prod-gate-hardening/baselines.json``: it verifies the frozen cache against ``SHA256SUMS``,
@@ -11,6 +11,8 @@ copies it to a fresh scratch directory ``<repro_root>/<NAME>[/<TAG>]/data`` (run
 the frozen copies are read-only), empties ``.../out``, and runs the baseline's ``original_args`` with ``--data-dir``
 and ``--out-dir`` pointed there, followed by any extra args. ``--drop-inputs-checkpoint`` deletes
 ``inputs_check_results.parquet`` from the scratch copy so the inputs check is recomputed instead of replayed.
+``--adopt`` (needed since Phase 1, which refuses caches without a manifest) first runs ``adopt-cache`` on the scratch
+copy with the window, AOI and venue of ``original_args``, then appends ``--offline --regression-baseline``.
 
 Blocked before the CLI is imported: ``requests.Session.request``, ``urllib3`` connection pools (requests and
 botocore), ``boto3.client``/``boto3.resource`` and their ``Session`` methods, ``botocore`` HTTP sends,
@@ -197,6 +199,22 @@ def prepare_repro(name: str, tag: str | None, drop_inputs_checkpoint: bool, base
     return args
 
 
+ADOPT_FLAGS = {'--start': 1, '--stop': 1, '--bbox': 4, '--venue': 1, '--data-dir': 1}
+
+
+def adopt_args(run_args: list[str]) -> list[str]:
+    """Return the ``adopt-cache`` arguments (window, AOI, venue, data dir) of a ``run-all`` command line."""
+    out, i = ['adopt-cache'], 0
+    while i < len(run_args):
+        n = ADOPT_FLAGS.get(run_args[i])
+        if n is None:
+            i += 1
+            continue
+        out += run_args[i : i + 1 + n]
+        i += 1 + n
+    return out
+
+
 def main(argv: list[str]) -> int:
     """Run the CLI with the network blocked; return the process exit code."""
     if argv[:1] == ['--repro-baseline']:
@@ -204,9 +222,17 @@ def main(argv: list[str]) -> int:
         parser.add_argument('--repro-baseline', required=True)
         parser.add_argument('--repro-tag', default=None)
         parser.add_argument('--drop-inputs-checkpoint', action='store_true')
+        parser.add_argument('--adopt', action='store_true')
         parser.add_argument('--baselines', type=Path, default=DEFAULT_BASELINES)
         opts, extra = parser.parse_known_args(argv)
         argv = prepare_repro(opts.repro_baseline, opts.repro_tag, opts.drop_inputs_checkpoint, opts.baselines) + extra
+        if opts.adopt:
+            from dist_s1_prod_check.cli import cli
+
+            adopt = adopt_args(argv)
+            print(f'dist-s1-prod-check {" ".join(adopt)}', file=sys.stderr)
+            cli.main(args=adopt, prog_name='dist-s1-prod-check', standalone_mode=False)
+            argv += ['--offline', '--regression-baseline']
 
     print(f'network blocked: {", ".join(PATCHED)}', file=sys.stderr)
     print(f'dist-s1-prod-check {" ".join(argv)}', file=sys.stderr)

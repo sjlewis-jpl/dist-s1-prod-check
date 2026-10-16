@@ -4,10 +4,11 @@ from pathlib import Path
 import pandas as pd
 import rasterio
 from rasterio.env import Env
-from tenacity import retry, stop_after_attempt, wait_random_exponential
+from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_random_exponential
 from tqdm import tqdm
 
 from dist_s1_prod_check.constants import DEFAULT_TAG_WORKERS
+from dist_s1_prod_check.network import OfflineError, is_offline, network_allowed
 
 
 COOKIE_FILE = str(Path.home() / '.dist_s1_prod_check_cookies.txt')
@@ -15,8 +16,14 @@ COOKIE_FILE = str(Path.home() / '.dist_s1_prod_check_cookies.txt')
 TAG_KEYS = ['mgrs_tile_id', 'pre_rtc_opera_ids', 'post_rtc_opera_ids', 'prior_dist_s1_product']
 
 
-@retry(stop=stop_after_attempt(10), wait=wait_random_exponential(multiplier=1, max=60), reraise=True)
+@retry(
+    stop=stop_after_attempt(10),
+    wait=wait_random_exponential(multiplier=1, max=60),
+    retry=retry_if_not_exception_type(OfflineError),
+    reraise=True,
+)
 def get_tags(url: str) -> dict[str, str]:
+    network_allowed(f'reading tags from {url}')
     gdal_env = {
         'GDAL_DISABLE_READDIR_ON_OPEN': 'EMPTY_DIR',
         'CPL_VSIL_CURL_ALLOWED_EXTENSIONS': '.tif',
@@ -64,18 +71,28 @@ def fetch_tags_table(
     `url_template` reads the layer from somewhere other than the CMR `alert_url`, e.g. the producing
     venue's S3 bucket. It is formatted with each product row, so `{opera_id}`, `{mgrs_tile_id}` and
     `{acq_time:%Y%m%d}` are available.
+
+    In offline mode cached rows holding a read error are kept, not retried, with `(not retried: offline)`
+    appended to their error in the returned frame (never in the parquet), and any product with no cached row
+    raises `OfflineError`.
     """
     out_path = Path(out_path)
     if url_template:
         urls = [url_template.format(**row) for row in df_products.to_dict('records')]
         df_products = df_products.assign(alert_url=urls)
     df_existing = pd.read_parquet(out_path) if out_path.exists() else pd.DataFrame(columns=['opera_id', 'error'])
-    if retry_errors:
+    offline = is_offline()
+    if retry_errors and not offline:
         df_existing = df_existing[df_existing.error == '']
 
     todo = df_products[~df_products.opera_id.isin(df_existing.opera_id)][['opera_id', 'alert_url']]
     todo = todo[todo.alert_url.notna()]
     records = todo.to_dict('records')
+    if offline:
+        if records:
+            network_allowed(f'fetching tags for {len(records)} products with no cached tag row')
+        failed = df_existing.error.fillna('') != ''
+        return df_existing.assign(error=df_existing.error.where(~failed, df_existing.error + ' (not retried: offline)'))
     if not records:
         return df_existing
     _preflight(records[0]['alert_url'])
