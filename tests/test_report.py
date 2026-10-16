@@ -311,3 +311,15 @@ def test_f19_unmapped_failures_counted(tmp_path: Path) -> None:
     assert sec['n_unmapped'] == 2
     assert sum(f['properties']['n_failures'] for f in sec['geojson']['features']) + sec['n_unmapped'] == 3
     assert render(out, leaflet=True)['error'] is None
+
+
+# F33: the export button and row count did not say which rows they cover.
+def test_f33_export_and_paging_labels(tmp_path: Path) -> None:
+    from jsrender import render
+
+    df = pd.DataFrame({'opera_id': [f'p{i}' for i in range(1500)], 'mgrs_tile_id': TILE, 'reason': 'bad'})
+    section = report.build_section('many', 'Many', 'Failures.', df, 1500)
+    page = render(report.write_html_report([section], _tile_geoms([TILE]), tmp_path / 'r.html'))
+    assert page['error'] is None, page['error']
+    assert page['elements']['count-0']['textContent'].startswith('displaying 1–1,000 of 1,500 rows')
+    assert page['elements']['csv-0']['textContent'] == 'Export 1,500 shown rows'

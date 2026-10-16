@@ -479,7 +479,9 @@ DATA.sections.forEach((sec, i) => {
     ${sec.records.length === 0 ? `<div class="${sec.green ? 'empty' : 'empty na'}">${esc(sec.verdict)}</div>` : `
     <div class="controls">
       <input type="search" placeholder="Filter rows&hellip;" id="filter-${i}">
-      <button id="csv-${i}">Download CSV</button>
+      <button id="prev-${i}">&lsaquo; Prev</button>
+      <button id="next-${i}">Next &rsaquo;</button>
+      <button id="csv-${i}">Export</button>
       <span class="count" id="count-${i}"></span>
     </div>
     <div class="tbl-wrap"><table id="tbl-${i}"></table></div>
@@ -498,12 +500,15 @@ DATA.sections.forEach((sec, i) => {
     return String(va).localeCompare(String(vb)) * sort.dir;
   };
   let filterText = '';
+  let page = 0;
   const render = () => {
     const f = filterText.toLowerCase();
     let rows = f ? sec.records.filter(r => sec.columns.some(c => String(r[c] ?? '').toLowerCase().includes(f)))
                  : sec.records.slice();
     if (sort.col !== null) rows = rows.slice().sort(cmp);
-    const shown = rows.slice(0, RENDER_LIMIT);
+    const nPages = Math.max(1, Math.ceil(rows.length / RENDER_LIMIT));
+    page = Math.min(page, nPages - 1);
+    const shown = rows.slice(page * RENDER_LIMIT, (page + 1) * RENDER_LIMIT);
     const arrow = c => sort.col === c ? (sort.dir === 1 ? ' ▲' : ' ▼') : '';
     let html = '<thead><tr>' + sec.columns.map(c => `<th data-col="${esc(c)}">${esc(c)}${arrow(c)}</th>`).join('') + '</tr></thead><tbody>';
     html += shown.map(r => '<tr>' + sec.columns.map(c => {
@@ -518,13 +523,20 @@ DATA.sections.forEach((sec, i) => {
       sort.col = col;
       current = render();
     }));
+    // F33: say exactly which rows are displayed and which the export holds (the embedded, filtered rows only).
+    const first = rows.length ? page * RENDER_LIMIT + 1 : 0;
+    const embedded = sec.truncated ? `; ${esc(sec.truncation_note)}` : '';
     document.getElementById(`count-${i}`).textContent =
-      `showing ${shown.length.toLocaleString()} of ${rows.length.toLocaleString()} rows (click a header to sort)`;
+      `displaying ${first.toLocaleString()}–${(page * RENDER_LIMIT + shown.length).toLocaleString()} of ` +
+      `${rows.length.toLocaleString()} rows${f ? ' matching the filter' : ''}${embedded} (click a header to sort)`;
+    document.getElementById(`csv-${i}`).textContent = `Export ${rows.length.toLocaleString()} shown rows`;
     return rows;
   };
   let current = render();
   const filterInput = document.getElementById(`filter-${i}`);
-  filterInput.addEventListener('input', e => { filterText = e.target.value; current = render(); });
+  filterInput.addEventListener('input', e => { filterText = e.target.value; page = 0; current = render(); });
+  document.getElementById(`prev-${i}`).addEventListener('click', () => { page = Math.max(0, page - 1); current = render(); });
+  document.getElementById(`next-${i}`).addEventListener('click', () => { page += 1; current = render(); });
   el.querySelectorAll('.summary-tbl tbody tr').forEach(tr => tr.addEventListener('click', () => {
     filterText = tr.dataset.filter;
     filterInput.value = filterText;
