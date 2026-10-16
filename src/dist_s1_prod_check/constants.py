@@ -47,4 +47,6 @@ INPUTS_CHECKPOINT_PARQUET = 'inputs_check_results.parquet'
 TARGET_TILES_FILE = 'target_mgrs_tiles.txt'
 # Largest |acquisition time difference| between an RTC-S1 pass and the DIST-S1 product it triggered for the two to
 # be matched (coverage, orphans) or for a product's tagged post inputs to belong to its own acquisition (inputs).
-PASS_MATCH_TOLERANCE_SECONDS = 3600
+# True matches measured on the frozen caches are <= 23 s and distinct passes of a tile are >= 2872 s apart; see
+# docs/CHECKS.md, "Coverage matching tolerance".
+PASS_MATCH_TOLERANCE_SECONDS = 120
