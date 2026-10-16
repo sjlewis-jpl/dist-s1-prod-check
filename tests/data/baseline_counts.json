@@ -16,6 +16,7 @@
       "1"
     ],
     "csv_rows": {
+      "confirmation": 618,
       "confirmation_failures": 2,
       "confirmation_tiles": 19,
       "coverage": 747,
@@ -82,6 +83,7 @@
       "1"
     ],
     "csv_rows": {
+      "confirmation": 582,
       "confirmation_failures": 563,
       "confirmation_tiles": 19,
       "coverage": 747,
@@ -98,7 +100,7 @@
     },
     "sections": {
       "confirmation": {
-        "n_checked": 563,
+        "n_checked": 561,
         "n_failures": 563
       },
       "coverage": {

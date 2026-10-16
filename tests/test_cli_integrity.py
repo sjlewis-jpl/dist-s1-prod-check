@@ -156,7 +156,6 @@ def test_f01_cache_bbox_mismatch_refused(tmp_path: Path, tmp_data_dir: Path, cli
 
 
 # aa2014f: inputs CSV holds 1 product, not 2; the null-URL product is absent (confirmation tiles n_products=1 too).
-@pytest.mark.xfail(strict=True, reason='F03: product with alert_url=None dropped from confirmation and inputs')
 def test_f03_null_tag_url_is_unknown_not_dropped(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
     dist, rtc, tag_df = _world(n=2)
     null_id = dist.opera_id.iloc[1]
@@ -176,7 +175,7 @@ def test_f03_null_tag_url_is_unknown_not_dropped(tmp_path: Path, tmp_data_dir: P
         row = df[df.opera_id == null_id]
         assert len(row) == 1, name
         assert row.status.iloc[0] == 'UNKNOWN', name
-        assert 'missing_tag_url' in ' '.join(row.astype(str).iloc[0]), name
+        assert 'missing_tag_url' in ' '.join(row.fillna('').astype(str).iloc[0]), name
 
 
 # ---------------------------------------------------------------------------------------------------------------

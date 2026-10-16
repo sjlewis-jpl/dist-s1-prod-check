@@ -10,7 +10,7 @@ from rasterio.errors import RasterioIOError
 
 from dist_s1_prod_check import tags
 from dist_s1_prod_check.cli import cli
-from factories import bursts_for_tile, dist_id, make_dist, make_rtc, rtc_id, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, rtc_id, seed_data_dir
 
 
 TILE = '10SGC'
@@ -90,3 +90,40 @@ def test_f14_latest_status_404_is_unknown_in_coverage(
     assert row['matched_opera_id'] == latest, 'must stay matched to the latest version, never the older readable copy'
     assert row.get('status') == 'UNKNOWN', f'latest product unreadable but coverage row is {row}'
     assert 'latest product unreadable' in row['reason']
+
+
+def _products(n: int = 3) -> pd.DataFrame:
+    acqs = [ACQ_READABLE + pd.Timedelta(days=12 * k) for k in range(n)]
+    return make_dist([{'opera_id': dist_id(TILE, a, a + pd.Timedelta(hours=10))} for a in acqs])
+
+
+def test_f03_fetch_tags_table_one_row_per_requested_product(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    df = _products(3)
+    no_url = df.opera_id.iloc[1]
+    df.loc[df.opera_id == no_url, 'alert_url'] = None
+    out = tmp_path / 'tags.parquet'
+    # An unrelated product cached earlier must not leak into this request's result.
+    make_tags([{'opera_id': dist_id('11SLT', ACQ_READABLE, '2026-01-03')}]).to_parquet(out)
+    monkeypatch.setattr(tags, 'get_tags', _fake_get_tags(set(), {}))
+
+    result = tags.fetch_tags_table(df, out, max_workers=1)
+
+    assert result.opera_id.tolist() == df.opera_id.tolist()
+    assert result.set_index('opera_id').error.to_dict() == {
+        df.opera_id.iloc[0]: '',
+        no_url: 'missing_tag_url',
+        df.opera_id.iloc[2]: '',
+    }
+    cached = pd.read_parquet(out)
+    assert no_url not in set(cached.opera_id), 'missing_tag_url is not a read result and must not be cached'
+
+
+def test_f03_universe_assertion_raises_on_dropped_product() -> None:
+    from dist_s1_prod_check import cli as cli_mod
+
+    df = pd.DataFrame({'opera_id': ['a', 'b']})
+    cli_mod._require_one_row_per_product(df, pd.Series(['a', 'b']), 'inputs')
+    with pytest.raises(RuntimeError, match='1 missing'):
+        cli_mod._require_one_row_per_product(df, pd.Series(['a', 'b', 'c']), 'inputs')
+    with pytest.raises(RuntimeError, match='duplicated'):
+        cli_mod._require_one_row_per_product(pd.concat([df, df]), pd.Series(['a', 'b']), 'confirmation', unique=True)

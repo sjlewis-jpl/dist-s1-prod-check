@@ -1,6 +1,8 @@
+import numpy as np
 import pandas as pd
 
 from dist_s1_prod_check.ids import get_opera_id_trunc
+from dist_s1_prod_check.status import Status
 
 
 # Deterministic order within a tile/acquisition group: last processed wins, ties broken by the full opera_id.
@@ -127,7 +129,12 @@ def check_confirmation(
     df_tags: pd.DataFrame,
     expect_none_at_start: bool = False,
 ) -> pd.DataFrame:
-    """Check each product's `prior_dist_s1_product` tag points to the previous product in its tile's time series."""
+    """Check each product's `prior_dist_s1_product` tag points to the previous product in its tile's time series.
+
+    Returns one row per product of `df_dist_dedup` with a `status`: UNKNOWN when its tag could not be read (no tag
+    row, no tag URL, read error), SKIPPED for the first product of a tile in the window unless
+    `expect_none_at_start`, else PASS or FAIL. `confirmed_ok` is False for both FAIL and UNKNOWN.
+    """
     df = df_dist_dedup.merge(df_tags[['opera_id', 'prior_dist_s1_product', 'error']], on='opera_id', how='left')
     df = df.sort_values(['mgrs_tile_id', 'acq_time'])
 
@@ -144,9 +151,16 @@ def check_confirmation(
         df.loc[df.is_first_in_window, 'confirmed_ok'] = True
     df.loc[df.tag_missing, 'confirmed_ok'] = False
 
+    df['status'] = np.select(
+        [df.tag_missing, df.is_first_in_window & (not expect_none_at_start), df.confirmed_ok],
+        [Status.UNKNOWN, Status.SKIPPED, Status.PASS],
+        Status.FAIL,
+    )
+
     def _reason(row: pd.Series) -> str:
         if row.tag_missing:
-            return 'could not read prior_dist_s1_product tag'
+            detail = row.error if isinstance(row.error, str) and row.error else 'no tag row'
+            return f'could not read prior_dist_s1_product tag ({detail})'
         if not row.confirmed_ok:
             return f'prior product used: {row.prior_used}; expected: {row.prior_expected}'
         return ''
@@ -164,6 +178,7 @@ def check_confirmation(
         'tag_missing',
         'tile_incomplete',
         'confirmed_ok',
+        'status',
         'reason',
     ]
     extra = [c for c in ['alert_url'] if c in df.columns]

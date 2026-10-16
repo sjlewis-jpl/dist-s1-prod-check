@@ -17,6 +17,7 @@ from dist_s1_prod_check.constants import (
 )
 from dist_s1_prod_check.ids import get_acq_timestamp, get_burst_id, get_opera_id_trunc, get_track_number
 from dist_s1_prod_check.network import OfflineError, network_allowed
+from dist_s1_prod_check.tags import MISSING_TAG_URL
 
 
 N_S1_TRACKS = 175
@@ -267,7 +268,7 @@ def check_inputs_offline(
             'opera_id': row.opera_id,
             'mgrs_tile_id': row.mgrs_tile_id,
             'inputs_correct': None,
-            'issue_type': 'Tag read error',
+            'issue_type': 'Missing tag URL' if row.error == MISSING_TAG_URL else 'Tag read error',
             'issue_value': row.error,
         }
         for row in df_err.itertuples()

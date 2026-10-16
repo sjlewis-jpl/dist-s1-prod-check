@@ -608,7 +608,10 @@ def fetch_tags(
         df_dist, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
     )
     n_err = int((df_tags.error != '').sum())
-    click.echo(f'Tags: {len(df_tags)} fetched, {n_err} errors -> {data_dir / TAGS_PARQUET}')
+    n_no_url = int((df_tags.error == tags.MISSING_TAG_URL).sum())
+    click.echo(
+        f'Tags: {len(df_tags)} products, {n_err} errors ({n_no_url} with no tag URL) -> {data_dir / TAGS_PARQUET}'
+    )
 
 
 def _wkt_by_tile(tile_geoms: gpd.GeoDataFrame) -> dict[str, str]:
@@ -700,12 +703,13 @@ def _confirmation_section(
     state: SectionState = SectionState.COMPLETE,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_conf = checks.check_confirmation(df_dedup, df_tags, expect_none_at_start=expect_none_at_start)
-    df_conf = df_conf[df_conf.opera_id.isin(df_tags.opera_id)]
+    # The predecessor comes from the full deduplicated table; the universe is the products whose tags were read
+    # for this run (all of them, or the --sample-inputs sample), each with exactly one status (F03).
+    df_conf = df_conf[df_conf.opera_id.isin(df_tags.opera_id)].reset_index(drop=True)
+    _require_one_row_per_product(df_conf, df_tags.opera_id, 'confirmation', unique=True)
     df_bad = _append_tile_wkt(df_conf[~df_conf.confirmed_ok], wkt_map)
-    # A first-in-window product has no predecessor to compare against unless the window starts the mission.
-    skipped = df_conf.is_first_in_window & ~df_conf.tag_missing & (not expect_none_at_start)
-    n_skipped = int(skipped.sum())
-    n_fail = int((~df_conf.confirmed_ok).sum())
+    counts = df_conf.status.value_counts().to_dict()
+    n_skipped = counts.get(Status.SKIPPED, 0)
     section = report.build_section(
         'confirmation',
         'Confirmation chain',
@@ -713,14 +717,14 @@ def _confirmation_section(
         'The first product of each tile in the window has no predecessor to check and is skipped unless '
         '--expect-none-at-start is set.',
         df_bad,
-        len(df_conf) - n_skipped,
+        int(df_conf.status.isin(EVALUATED).sum()),
         state=state,
         n_universe=len(df_dedup),
         n_skipped=n_skipped,
-        counts={Status.PASS: len(df_conf) - n_skipped - n_fail, Status.FAIL: n_fail},
+        counts=counts,
     )
     tiles = checks.summarize_by_tile(df_conf.assign(fail=~df_conf.confirmed_ok), 'fail')
-    return [section], {'confirmation_failures': df_bad, 'confirmation_tiles': tiles}
+    return [section], {'confirmation_failures': df_bad, 'confirmation_tiles': tiles, 'confirmation': df_conf}
 
 
 def _inputs_section(
@@ -739,6 +743,8 @@ def _inputs_section(
         df_results = inputs.check_inputs_online(df_tags, max_workers=workers)
     if df_results.empty:
         df_results = pd.DataFrame(columns=inputs.RESULT_COLUMNS)
+    _require_one_row_per_product(df_results, df_tags.opera_id, 'inputs')
+    df_results = df_results.assign(status=_row_status(df_results))
     df_bad = _append_tile_wkt(df_results[df_results.inputs_correct != True], wkt_map)  # noqa: E712
     product_status = _inputs_product_status(df_results)
     counts = product_status.value_counts().to_dict()
@@ -794,11 +800,27 @@ def _inputs_section(
     return sections, csvs
 
 
+def _require_one_row_per_product(df: pd.DataFrame, universe: pd.Series, check: str, unique: bool = False) -> None:
+    """Raise if a check's results do not cover its product universe exactly (F03): nothing may drop out."""
+    ids, expected = set(df.opera_id), set(universe)
+    duplicated = unique and df.opera_id.duplicated().any()
+    if ids != expected or duplicated:
+        raise RuntimeError(
+            f'{check} results do not match its universe of {len(expected)} products: {len(expected - ids)} missing, '
+            f'{len(ids - expected)} unexpected' + (', duplicated rows' if duplicated else '')
+        )
+
+
+def _row_status(df_results: pd.DataFrame) -> pd.Series:
+    """Status of each inputs result row: PASS, FAIL, or UNKNOWN when the row could not be checked."""
+    return df_results.inputs_correct.map({True: Status.PASS, False: Status.FAIL}).fillna(Status.UNKNOWN).astype(str)
+
+
 def _inputs_product_status(df_results: pd.DataFrame) -> pd.Series:
     """One status per product: UNKNOWN if any row could not be checked, else FAIL if any row failed, else PASS."""
     if df_results.empty:
         return pd.Series(dtype=str)
-    value = df_results.inputs_correct.map({True: Status.PASS, False: Status.FAIL}).fillna(Status.UNKNOWN)
+    value = _row_status(df_results)
     rank = value.map({Status.UNKNOWN: 0, Status.FAIL: 1, Status.PASS: 2})
     return value.groupby(df_results.opera_id).agg(lambda v: v.loc[rank[v.index].idxmin()])
 
@@ -923,8 +945,8 @@ def check_confirmation(
         'confirmation',
         'DIST-S1 confirmation chain',
         lambda run: _confirmation_section(
-            checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions)),
-            _load_tags(data_dir),
+            df_dedup := checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions)),
+            tags.align_to_products(df_dedup, _load_tags(data_dir)),
             expect_none_at_start,
             _wkt_by_tile(_all_tile_geoms()),
         ),
@@ -959,8 +981,8 @@ def check_inputs(
 
     def build(run: _Run) -> tuple[list[dict], dict[str, pd.DataFrame]]:
         df_dist = _load_dist_checked(data_dir, run, product_versions)
-        df_tags = _load_tags(data_dir)
-        n_universe = len(df_tags := df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)])
+        df_tags = tags.align_to_products(checks.deduplicate_products(df_dist), _load_tags(data_dir))
+        n_universe = len(df_tags)
         state = SectionState.COMPLETE
         if sample:
             df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
@@ -1184,7 +1206,6 @@ def run_all(
         df_tags = tags.fetch_tags_table(
             df_tags_products, data_dir / TAGS_PARQUET, max_workers=workers, url_template=tag_url_template
         )
-        df_tags = df_tags[df_tags.opera_id.isin(df_tags_products.opera_id)]
         _record_file(run, data_dir / TAGS_PARQUET)
 
         wkt_map = _wkt_by_tile(_all_tile_geoms())
