@@ -716,14 +716,26 @@ def _duplicates_section(
     df_dist: gpd.GeoDataFrame, wkt_map: dict[str, str], state: SectionState = SectionState.COMPLETE
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_dup = _append_tile_wkt(checks.check_duplicates(df_dist), wkt_map)
+    # Units (F12): every acquisition is one group; a group with more than one version is a duplicate group.
+    n_acquisitions = int(df_dist.opera_dedup_id.nunique()) if len(df_dist) else 0
+    n_groups = int(df_dup.latest_opera_id.nunique()) if len(df_dup) else 0
     section = report.build_section(
         'duplicates',
         'Duplicates',
         'DIST-S1 granules sharing the same tile and acquisition time. The last-processed granule of '
-        'each group is taken as the correct one; every other check runs on that granule only.',
+        'each group is taken as the correct one; every other check runs on that granule only. Counted in '
+        'duplicate groups (acquisitions with more than one version); the table lists every version.',
         df_dup,
-        len(df_dist),
+        n_acquisitions,
         state=state,
+        unit='duplicate groups',
+        counts={Status.PASS: n_acquisitions - n_groups, Status.FAIL: n_groups},
+        extra={
+            'n_products': len(df_dist),
+            'n_groups': n_groups,
+            'n_versions': len(df_dup),
+            'n_superseded': int((~df_dup.is_latest.astype(bool)).sum()) if len(df_dup) else 0,
+        },
     )
     return [section], {'duplicates': df_dup}
 
@@ -810,6 +822,7 @@ def _confirmation_section(
         df_bad,
         int(df_conf.status.isin(EVALUATED).sum()),
         state=state,
+        unit='links',
         n_universe=len(df_dedup),
         n_skipped=n_skipped,
         counts=counts,
@@ -846,13 +859,16 @@ def _inputs_section(
     n_universe = len(product_status) if n_universe is None else n_universe
 
     def _counts(df_subset: pd.DataFrame) -> dict[str, int]:
-        n_bad = df_subset.opera_id.nunique()
-        return {Status.FAIL: n_bad, Status.PASS: max(n_checked - n_bad, 0)}
+        """Count products with an issue in the subset by status; the other checked products PASS for it."""
+        status = _inputs_product_status(df_subset)
+        n_fail, n_unknown = int((status == Status.FAIL).sum()), int((status == Status.UNKNOWN).sum())
+        return {Status.FAIL: n_fail, Status.UNKNOWN: n_unknown, Status.PASS: max(n_checked - n_fail, 0)}
 
     common = {'state': state, 'n_universe': n_universe}
 
     post_mask = df_bad.issue_type.str.contains('Post', case=False)
     pre_mask = df_bad.issue_type.str.contains('Pre', case=False) & ~post_mask
+    other_mask = ~post_mask & ~pre_mask  # the three subsections partition every issue (F12)
     sections = [
         report.build_section(
             'inputs',
@@ -888,11 +904,23 @@ def _inputs_section(
             counts=_counts(df_bad[pre_mask]),
             **common,
         ),
+        report.build_section(
+            'inputs_other',
+            'Inputs: other issues',
+            'Product-input issues that are neither pre nor post specific: burst or track mismatches, identity '
+            'mismatches, claims, tag read and enumeration errors.',
+            df_bad[other_mask],
+            n_checked,
+            summary=_issue_summary(df_bad[other_mask]),
+            counts=_counts(df_bad[other_mask]),
+            **common,
+        ),
     ]
     csvs = {
         'inputs_failures': df_bad,
         'inputs_failures_post': df_bad[post_mask],
         'inputs_failures_pre': df_bad[pre_mask],
+        'inputs_failures_other': df_bad[other_mask],
         'inputs': df_results,
     }
     return sections, csvs
@@ -932,6 +960,13 @@ def _inputs_product_status(df_results: pd.DataFrame) -> pd.Series:
     value = _row_status(df_results).replace({Status.INFO: Status.PASS})
     rank = value.map({Status.UNKNOWN: 0, Status.FAIL: 1, Status.PASS: 2})
     return value.groupby(df_results.opera_id).agg(lambda v: v.loc[rank[v.index].idxmin()])
+
+
+def _eligible(df_cov: pd.DataFrame) -> pd.Series:
+    """Return which passes have baseline imagery (`eligible`; older frames: found or missing-and-expected)."""
+    if 'eligible' in df_cov.columns:
+        return df_cov.eligible.astype(bool)
+    return df_cov.product_found.astype(bool) | df_cov.missing_product_expected.astype(bool)
 
 
 def _coverage_section(
@@ -994,6 +1029,11 @@ def _coverage_section(
         n_universe=len(df_cov),
         n_skipped=int((df_cov.status == Status.SKIPPED).sum()),
         counts=df_cov.status.value_counts().to_dict(),
+        extra={
+            'n_eligible': int(_eligible(df_cov).sum()),
+            'n_found': int(df_cov.product_found.astype(bool).sum()),
+            'n_missing': int((df_cov.status == Status.FAIL).sum()),
+        },
     )
     csvs = {
         'coverage_missing': df_missing,

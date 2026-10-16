@@ -163,12 +163,12 @@ def _inputs_sections(monkeypatch: pytest.MonkeyPatch, issues: list[tuple[str, st
         ]
     )
     monkeypatch.setattr(cli_mod.inputs, 'check_inputs_offline', lambda *a, **k: df_results)
-    sections, _ = cli_mod._inputs_section(pd.DataFrame(), None, 'offline', 1, {})
+    df_tags = pd.DataFrame({'opera_id': df_results.opera_id.unique()})  # the universe (F03 assertion)
+    sections, _ = cli_mod._inputs_section(df_tags, None, 'offline', 1, {})
     return {s['key']: s for s in sections}
 
 
 # aa2014f: n_failures=4 (issue rows) against n_checked=3 products; no n_failed/n_issues/unit keys.
-@pytest.mark.xfail(strict=True, reason='F12: inputs section counts issue rows against a product denominator')
 def test_f12_inputs_counts_products_and_issues_separately(monkeypatch: pytest.MonkeyPatch) -> None:
     a, b, c = _chain(TILE, 3)
     secs = _inputs_sections(
@@ -189,7 +189,6 @@ def test_f12_inputs_counts_products_and_issues_separately(monkeypatch: pytest.Mo
 
 
 # aa2014f: inputs_post + inputs_pre hold 2 of 4 issues; 'Burst ID mismatch' and track issues fall in neither.
-@pytest.mark.xfail(strict=True, reason='F12: pre/post inputs subsections do not cover every issue (no OTHER)')
 def test_f12_inputs_issue_subsections_partition_all_issues(monkeypatch: pytest.MonkeyPatch) -> None:
     a, b, _ = _chain(TILE, 3)
     secs = _inputs_sections(
@@ -208,7 +207,6 @@ def test_f12_inputs_issue_subsections_partition_all_issues(monkeypatch: pytest.M
 
 
 # aa2014f: n_checked=3 includes the ineligible pass; no n_universe/n_eligible/n_missing keys.
-@pytest.mark.xfail(strict=True, reason='F12: coverage denominator includes passes that cannot trigger a product')
 def test_f12_coverage_counts_universe_eligible_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     post = [ACQ0 + pd.Timedelta(days=12 * k) for k in range(3)]
     df_cov = pd.DataFrame(
@@ -217,11 +215,14 @@ def test_f12_coverage_counts_universe_eligible_missing(monkeypatch: pytest.Monke
             'post_acq_dt': pd.to_datetime(post).tz_localize('UTC'),
             'product_found': [True, False, False],
             'missing_product_expected': [True, True, False],  # eligible, eligible, ineligible (no baseline)
+            'eligible': [True, True, False],
+            'status': ['PASS', 'FAIL', 'SKIPPED'],
             'burst_ids': [''] * 3,
             'burst_pols': [''] * 3,
         }
     )
     monkeypatch.setattr(cli_mod.coverage, 'expected_pass_groups', lambda *a, **k: pd.DataFrame())
+    monkeypatch.setattr(cli_mod.matching, 'assign_passes', lambda *a, **k: None)
     monkeypatch.setattr(cli_mod.coverage, 'check_coverage', lambda *a, **k: df_cov)
     monkeypatch.setattr(cli_mod.coverage, 'check_orphan_products', lambda *a, **k: pd.DataFrame())
     sections, _ = cli_mod._coverage_section(pd.DataFrame(), None, '2026-01-01', '2026-03-01', {})
@@ -235,7 +236,6 @@ def test_f12_coverage_counts_universe_eligible_missing(monkeypatch: pytest.Monke
 
 
 # aa2014f: n_failures=5 (every version row); no n_groups/n_versions/n_superseded keys.
-@pytest.mark.xfail(strict=True, reason='F12: duplicates counts every version, not groups or superseded versions')
 def test_f12_duplicates_counts_groups_versions_superseded() -> None:
     acq1, acq2 = ACQ0, ACQ0 + pd.Timedelta(days=12)
     rows = [{'tile': TILE, 'acq': acq1, 'proc': acq1 + pd.Timedelta(hours=h)} for h in (6, 30, 54)]

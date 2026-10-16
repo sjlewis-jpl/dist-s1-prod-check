@@ -51,6 +51,7 @@ def build_section(
     n_skipped: int = 0,
     counts: dict[str, int] | None = None,
     note: str = '',
+    extra: dict[str, int] | None = None,
 ) -> dict:
     """Package one check's failures and counts for the HTML report.
 
@@ -58,6 +59,9 @@ def build_section(
     evaluated, and `n_universe` every unit the section should cover (default `n_checked + n_skipped`). `counts`
     maps each `Status` to a unit count; by default every failure row is one FAIL and the other checked units PASS.
     A COMPLETE section with an empty universe becomes EMPTY. The section is green only under `status.is_green`.
+
+    Units are explicit (F12): `n_failed` is the number of units with FAIL, `n_issues` the number of failure-table
+    rows (a unit can have several), and `extra` adds section-specific counts (e.g. `n_eligible`, `n_groups`).
 
     `summary` is an optional aggregate table `{'title', 'columns', 'records'}` rendered below the
     main table; clicking one of its rows filters the main table by the row's first cell.
@@ -87,6 +91,10 @@ def build_section(
         'verdict': _verdict(state, counts, n_checked),
         'note': note,
         'n_failures': int(len(df_failures)),
+        'n_failed': int(counts.get(Status.FAIL, 0)),
+        'n_unknown': int(counts.get(Status.UNKNOWN, 0)),
+        'n_issues': int(len(df_failures)),
+        **{k: int(v) for k, v in (extra or {}).items()},
         'truncated': truncated,
         'columns': df.columns.tolist(),
         'records': records,
@@ -367,6 +375,12 @@ function esc(s) {
   return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 }
 function isUrl(v) { return typeof v === 'string' && v.startsWith('https://'); }
+// Per-status unit counts, then the issue rows when they differ from the failed units (F12).
+function countText(sec) {
+  const parts = Object.entries(sec.counts).map(([k, v]) => `${k} ${v.toLocaleString()}`);
+  if (sec.n_issues !== sec.n_failed + sec.n_unknown) parts.push(`${sec.n_issues.toLocaleString()} issue rows`);
+  return esc(parts.join(' · '));
+}
 
 
 const tilesDiv = document.getElementById('tiles');
@@ -378,8 +392,9 @@ DATA.sections.forEach(sec => {
   tilesDiv.insertAdjacentHTML('beforeend', `
     <div class="tile${cls === 'na' ? ' grey' : ''}">
       <div class="label"><span class="swatch" style="background:${color}"></span>${esc(sec.title)}</div>
-      <div class="value ${cls}">${sec.n_failures.toLocaleString()}</div>
-      <div class="sub">flagged of ${sec.n_checked.toLocaleString()} ${esc(sec.unit)} checked${skipped}</div>
+      <div class="value ${cls}">${sec.n_failed.toLocaleString()}</div>
+      <div class="sub">failed of ${sec.n_checked.toLocaleString()} ${esc(sec.unit)} checked${skipped}</div>
+      <div class="sub">${countText(sec)}</div>
       <div class="sub">${esc(sec.state)} &middot; universe ${sec.n_universe.toLocaleString()} &middot; ${esc(sec.verdict)}</div>
     </div>`);
 });
@@ -419,7 +434,7 @@ DATA.sections.forEach((sec, i) => {
   el.innerHTML = `
     <h2><span class="swatch" style="background:${color};width:11px;height:11px;border-radius:3px;display:inline-block"></span>${esc(sec.title)}</h2>
     <div class="desc">${esc(sec.description)}${sec.truncated ? ' (table truncated; full results in the CSV written alongside this report)' : ''}</div>
-    <div class="desc"><b>${esc(sec.state)}</b> &middot; ${sec.n_checked.toLocaleString()} of ${sec.n_universe.toLocaleString()} ${esc(sec.unit)} checked, ${sec.n_skipped.toLocaleString()} skipped &middot; ${esc(sec.verdict)}${sec.note ? ' &middot; ' + esc(sec.note) : ''}</div>
+    <div class="desc"><b>${esc(sec.state)}</b> &middot; ${sec.n_failed.toLocaleString()} failed of ${sec.n_checked.toLocaleString()} checked (${esc(sec.unit)}); universe ${sec.n_universe.toLocaleString()}, ${sec.n_skipped.toLocaleString()} skipped &middot; ${countText(sec)} &middot; ${esc(sec.verdict)}${sec.note ? ' &middot; ' + esc(sec.note) : ''}</div>
     ${sec.records.length === 0 ? `<div class="${sec.green ? 'empty' : 'empty na'}">${esc(sec.verdict)}</div>` : `
     <div class="controls">
       <input type="search" placeholder="Filter rows&hellip;" id="filter-${i}">
