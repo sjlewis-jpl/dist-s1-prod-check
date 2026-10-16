@@ -8,7 +8,7 @@ from dist_s1_prod_check import inputs
 from dist_s1_prod_check.cmr import build_rtc_input_frame
 from dist_s1_prod_check.constants import DELTA_LOOKBACK_DAYS
 from dist_s1_prod_check.ids import get_opera_id_trunc
-from factories import bursts_for_tile, dist_id, make_rtc, make_tags
+from factories import bursts_for_tile, dist_id, make_rtc, make_tags, rtc_id
 
 
 TILE = '10SGC'
@@ -183,3 +183,67 @@ def test_f26_rtc_processing_version_difference_is_info() -> None:
     note = df.iloc[1]
     assert note.issue_type == 'RTC processing version differs'
     assert newer in note.issue_value and archived in note.issue_value
+
+
+ONLINE_BURSTS = {35: 'T035-073226-IW3', 36: 'T036-073300-IW1'}
+
+
+def _two_track_inputs() -> dict[int, dict[str, list[str]]]:
+    """Pre/post RTC ids per track of a product whose acquisition group spans adjacent tracks 35 and 36."""
+    post = {35: T_B, 36: T_B + pd.Timedelta(seconds=40)}
+    return {
+        track: {
+            'pre': [rtc_id(burst, post[track] - pd.Timedelta(days=365 + 12 * k), PROC) for k in range(1, 3)],
+            'post': [rtc_id(burst, post[track], PROC)],
+        }
+        for track, burst in ONLINE_BURSTS.items()
+    }
+
+
+def _fake_enumerator(by_track: dict, pols: dict[str, str], calls: list) -> object:
+    """Stand-in for `inputs._enumerate_one` that returns only the given track's inputs, with polarizations."""
+
+    def _enumerate_one(mgrs_tile_id: str, track_number: int, post_date: str) -> pd.DataFrame:
+        calls.append((mgrs_tile_id, track_number, post_date))
+        ids = by_track[track_number]
+        df = inputs.parse_actual_inputs(','.join(ids['pre']), ','.join(ids['post']))
+        return df.assign(polarizations=df.opera_id.map(lambda oid: pols.get(oid, 'VV+VH')))
+
+    return _enumerate_one
+
+
+def _online_tags(by_track: dict) -> pd.DataFrame:
+    # pre inputs of track 36 first, so the first input is not a post input of the first post track
+    return make_tags(
+        [
+            {
+                'opera_id': dist_id(TILE, T_B, PROC),
+                'pre_rtc_opera_ids': by_track[36]['pre'] + by_track[35]['pre'],
+                'post_rtc_opera_ids': by_track[35]['post'] + by_track[36]['post'],
+            }
+        ]
+    )
+
+
+# F24: online mode enumerates once per post track and takes its tracks from the post inputs.
+def test_f24_online_enumerates_each_post_track(monkeypatch: pytest.MonkeyPatch) -> None:
+    by_track, calls = _two_track_inputs(), []
+    monkeypatch.setattr(inputs, '_enumerate_one', _fake_enumerator(by_track, {}, calls))
+
+    df = inputs.check_inputs_online(_online_tags(by_track), max_workers=1)
+
+    assert sorted(calls) == [(TILE, 35, '2026-01-22'), (TILE, 36, '2026-01-22')]
+    assert df.status.tolist() == ['PASS'] and df.issue_type.tolist() == [''], df.to_dict('records')
+
+
+# F24: the polarization lookup covers the inputs of every enumerated track.
+def test_f24_online_polarization_lookup_covers_both_tracks(monkeypatch: pytest.MonkeyPatch) -> None:
+    by_track, calls = _two_track_inputs(), []
+    hh_pre = by_track[35]['pre'][0]  # not on the track of the first input (36)
+    monkeypatch.setattr(inputs, '_enumerate_one', _fake_enumerator(by_track, {hh_pre: 'HH+HV'}, calls))
+
+    df = inputs.check_inputs_online(_online_tags(by_track), max_workers=1)
+
+    rows = df[df.issue_type == 'Pre RTC baseline polarization mismatch']
+    assert len(rows) == 1 and get_opera_id_trunc(hh_pre) in rows.issue_value.iloc[0], df.to_dict('records')
+    assert set(df.status) == {'FAIL'}

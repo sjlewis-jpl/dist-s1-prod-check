@@ -521,25 +521,52 @@ def _enumerate_one(mgrs_tile_id: str, track_number: int, post_date: str) -> pd.D
     return df
 
 
+def _enumerate_post_tracks(mgrs_tile_id: str, post_tracks: list[int], post_date: str) -> pd.DataFrame:
+    """Enumerate one product's expected inputs once per post track and combine them (F24).
+
+    An acquisition group can span two adjacent tracks; enumerating each and dropping repeated inputs covers both
+    whether the enumerator returns one track's inputs or the whole product per call.
+    """
+    frames = [_enumerate_one(mgrs_tile_id, track, post_date) for track in post_tracks]
+    df = pd.concat(frames, ignore_index=True)
+    return df.drop_duplicates(['opera_id_trunc', 'input_category']).reset_index(drop=True)
+
+
 def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataFrame:
-    """Compare recorded RTC inputs against a live per-product re-enumeration (slow; use for small batches)."""
+    """Compare recorded RTC inputs against a live per-product re-enumeration (slow; use for small batches).
+
+    The tile and post date come from the product's own opera_id (F05), and the track numbers from its tagged post
+    inputs, one enumeration per post track (F24). The polarization lookup and the version notes use the RTC-S1
+    metadata the enumerator returned. Enumeration failures are UNKNOWN `Enumeration error`; tags that cannot be
+    parsed or compared are UNKNOWN `Comparison error`.
+    """
 
     def _one(row: tuple) -> list[dict]:
-        base = {'opera_id': row.opera_id, 'mgrs_tile_id': row.mgrs_tile_id}
+        tile = own_tile(row.opera_id)
+        base = {'opera_id': row.opera_id, 'mgrs_tile_id': tile}
         if row.error:
             return [_record(base, 'UNKNOWN', 'Tag read error', row.error)]
         try:
+            acq = get_acq_timestamp(row.opera_id)
             df_actual = parse_actual_inputs(row.pre_rtc_opera_ids, row.post_rtc_opera_ids)
-            df_post = df_actual[df_actual.input_category == 'post']
-            track_number = int(df_actual.track_number.iloc[0])
-            df_expected = _enumerate_one(row.mgrs_tile_id, track_number, str(df_post.acq_dt.min().date()))
+            post_tracks = sorted(df_actual[df_actual.input_category == 'post'].track_number.unique().tolist())
+        except Exception as e:
+            return [_record(base, 'UNKNOWN', 'Comparison error', _error_text(e))]
+        if not post_tracks:
+            return [_record(base, 'UNKNOWN', 'Comparison error', 'no post inputs in tags')]
+        try:
+            df_expected = _enumerate_post_tracks(tile, [int(t) for t in post_tracks], str(acq.date()))
+        except Exception as e:
+            return [_record(base, 'UNKNOWN', 'Enumeration error', _error_text(e))]
+        try:
             pol_by_opera_id = dict(zip(df_expected.opera_id_trunc, df_expected.polarizations))
             issues = [
+                *_identity_issues(row.mgrs_tile_id, tile, acq, df_actual),
                 *compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id),
                 *_version_notes(df_actual, archive_ids_by_trunc(df_expected.opera_id)),
             ]
         except Exception as e:
-            return [_record(base, 'UNKNOWN', 'Enumeration error', _error_text(e))]
+            return [_record(base, 'UNKNOWN', 'Comparison error', _error_text(e))]
         return _product_records(base, issues)
 
     rows = list(df_tags.itertuples())
