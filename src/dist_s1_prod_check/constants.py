@@ -50,3 +50,6 @@ TARGET_TILES_FILE = 'target_mgrs_tiles.txt'
 # True matches measured on the frozen caches are <= 23 s and distinct passes of a tile are >= 2872 s apart; see
 # docs/CHECKS.md, "Coverage matching tolerance".
 PASS_MATCH_TOLERANCE_SECONDS = 120
+# Largest elapsed time between a product's earliest and latest post RTC-S1 inputs (F37). The post inputs of one
+# product come from one acquisition, so a span near a day means inputs from different acquisitions.
+MAX_POST_SPAN_SECONDS = 86_400

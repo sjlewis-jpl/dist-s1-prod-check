@@ -16,6 +16,7 @@ from dist_s1_prod_check.constants import (
     DELTA_LOOKBACK_DAYS,
     DELTA_WINDOW_DAYS,
     DUAL_POLARIZATIONS,
+    MAX_POST_SPAN_SECONDS,
     MAX_PRE_IMGS_PER_BURST,
     PASS_MATCH_TOLERANCE_SECONDS,
     POST_DATE_BUFFER_SECONDS,
@@ -85,12 +86,18 @@ def _tracks_adjacent(track_numbers: list[int]) -> bool:
     return diff == 1 or diff == N_S1_TRACKS - 1
 
 
-def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str]) -> list[dict]:
-    """Flag inputs that are single polarization or whose baseline polarization differs from the post-image.
+def _polarization_issues(
+    df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str], check_single_pol: bool = False
+) -> list[dict]:
+    """Flag inputs whose baseline polarization differs from the post-image, and optionally single-pol inputs.
 
     A burst's baseline must be built from acquisitions of the same dual polarization as its post-image
     (VV+VH with VV+VH, HH+HV with HH+HV). Inputs absent from `pol_by_opera_id` (outside the RTC table)
     are skipped; the RTC ID comparisons already report those.
+
+    `check_single_pol` is for online mode, whose lookup comes from the enumerator's metadata. Offline it could
+    never fire: the RTC frame drops single-polarization granules, so such an input is absent from the lookup and
+    fails the RTC ID comparison instead (F38).
     """
     pols = df_actual.opera_id_trunc.map(pol_by_opera_id)
     df = df_actual.assign(polarizations=pols)[pols.notna()]
@@ -99,7 +106,7 @@ def _polarization_issues(df_actual: pd.DataFrame, pol_by_opera_id: dict[str, str
 
     issues = []
     df_single = df[~df.polarizations.isin(DUAL_POLARIZATIONS)]
-    if not df_single.empty:
+    if check_single_pol and not df_single.empty:
         detail = ';'.join(f'{r.opera_id_trunc}={r.polarizations}' for r in df_single.itertuples())
         issues.append(_issue('Single polarization input used', detail))
 
@@ -121,10 +128,12 @@ def compare_inputs(
     df_actual: pd.DataFrame,
     df_expected_product: pd.DataFrame,
     pol_by_opera_id: dict[str, str] | None = None,
+    check_single_pol: bool = False,
 ) -> list[dict]:
+    """Issues of a product's actual inputs against its expected product's inputs (see `_polarization_issues`)."""
     issues = []
     if pol_by_opera_id:
-        issues.extend(_polarization_issues(df_actual, pol_by_opera_id))
+        issues.extend(_polarization_issues(df_actual, pol_by_opera_id, check_single_pol=check_single_pol))
 
     track_numbers = sorted(df_actual.track_number.unique().tolist())
     if not _tracks_adjacent(track_numbers):
@@ -133,7 +142,7 @@ def compare_inputs(
     df_post = df_actual[df_actual.input_category == 'post']
     df_pre = df_actual[df_actual.input_category == 'pre']
     post_span = df_post.acq_dt.max() - df_post.acq_dt.min()
-    if post_span.days > 1:
+    if post_span.total_seconds() > MAX_POST_SPAN_SECONDS:
         issues.append(_issue('Post-dates span too long', str(post_span)))
 
     exp_post = df_expected_product[df_expected_product.input_category == 'post']
@@ -369,6 +378,7 @@ def checkpoint_context(rtc_sha256: str, options: dict | None = None) -> str:
             DELTA_WINDOW_DAYS,
             POST_DATE_BUFFER_SECONDS,
             PASS_MATCH_TOLERANCE_SECONDS,
+            MAX_POST_SPAN_SECONDS,
         ],
         'options': options or {},
     }
@@ -562,7 +572,7 @@ def check_inputs_online(df_tags: pd.DataFrame, max_workers: int = 8) -> pd.DataF
             pol_by_opera_id = dict(zip(df_expected.opera_id_trunc, df_expected.polarizations))
             issues = [
                 *_identity_issues(row.mgrs_tile_id, tile, acq, df_actual),
-                *compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id),
+                *compare_inputs(df_actual, df_expected, pol_by_opera_id=pol_by_opera_id, check_single_pol=True),
                 *_version_notes(df_actual, archive_ids_by_trunc(df_expected.opera_id)),
             ]
         except Exception as e:

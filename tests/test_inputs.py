@@ -22,8 +22,8 @@ def _group_bursts(tile: str = TILE, group: int = 0) -> list[str]:
     return lut[lut.acq_group_id_within_mgrs_tile == group].jpl_burst_id.tolist()
 
 
-def _rtc_frame() -> gpd.GeoDataFrame:
-    """RTC frame for one acquisition group holding posts A and B and a baseline for both."""
+def _rtc_frame(extra_rows: tuple[dict, ...] = ()) -> gpd.GeoDataFrame:
+    """RTC frame for one acquisition group holding posts A and B and a baseline for both, plus `extra_rows`."""
     posts = [T_A, T_B]
     pres = {
         post - pd.Timedelta(days=delta + 12 * k) for post in posts for delta in DELTA_LOOKBACK_DAYS for k in range(1, 5)
@@ -36,7 +36,7 @@ def _rtc_frame() -> gpd.GeoDataFrame:
     ]
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        return build_rtc_input_frame(make_rtc(rows), [TILE])
+        return build_rtc_input_frame(make_rtc([*rows, *extra_rows]), [TILE])
 
 
 def _expected_inputs(frame: gpd.GeoDataFrame, post: pd.Timestamp) -> dict[str, list[str]]:
@@ -247,3 +247,46 @@ def test_f24_online_polarization_lookup_covers_both_tracks(monkeypatch: pytest.M
     rows = df[df.issue_type == 'Pre RTC baseline polarization mismatch']
     assert len(rows) == 1 and get_opera_id_trunc(hh_pre) in rows.issue_value.iloc[0], df.to_dict('records')
     assert set(df.status) == {'FAIL'}
+
+
+# F37: the post-span limit is MAX_POST_SPAN_SECONDS of elapsed time, not `.days > 1` (which let 47 h through).
+@pytest.mark.parametrize(('span_hours', 'flagged'), [(23, False), (25, True)])
+def test_f37_post_span_limit_in_seconds(span_hours: int, flagged: bool) -> None:
+    post_ids = [
+        rtc_id(ONLINE_BURSTS[35], T_B, PROC),
+        rtc_id('T035-073227-IW1', T_B + pd.Timedelta(hours=span_hours), PROC),
+    ]
+    df_actual = inputs.parse_actual_inputs('', ','.join(post_ids))
+
+    issues = inputs.compare_inputs(df_actual, df_actual)
+
+    assert [i['issue_type'] for i in issues] == (['Post-dates span too long'] if flagged else [])
+
+
+# F38: offline, single-polarization granules are dropped from the frame, so such an input fails the set comparison
+# and there is no separate single-polarization diagnostic.
+def test_f38_offline_single_pol_input_fails_set_comparison_only() -> None:
+    burst = _group_bursts()[0]
+    single_acq = T_B - pd.Timedelta(days=400)
+    single = rtc_id(burst, single_acq, single_acq + pd.Timedelta(hours=3))
+    frame = _rtc_frame(({'opera_id': single, 'polarizations': 'VV'},))
+    tags_b = _expected_inputs(frame, T_B)
+    id_b = dist_id(TILE, T_B, PROC)
+    df_tags = make_tags([{'opera_id': id_b, **tags_b, 'pre_rtc_opera_ids': [*tags_b['pre_rtc_opera_ids'], single]}])
+
+    df = inputs.check_inputs_offline(df_tags, frame)
+
+    assert df.issue_type.tolist() == ['Pre RTC IDs found but not expected'], df.to_dict('records')
+    assert df.issue_value.iloc[0] == get_opera_id_trunc(single)
+
+
+# F38: online, the enumerator's metadata still names single-polarization inputs.
+def test_f38_online_single_pol_diagnostic_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    by_track, calls = _two_track_inputs(), []
+    single = by_track[35]['pre'][0]
+    monkeypatch.setattr(inputs, '_enumerate_one', _fake_enumerator(by_track, {single: 'VV'}, calls))
+
+    df = inputs.check_inputs_online(_online_tags(by_track), max_workers=1)
+
+    rows = df[df.issue_type == 'Single polarization input used']
+    assert len(rows) == 1 and get_opera_id_trunc(single) in rows.issue_value.iloc[0], df.to_dict('records')
