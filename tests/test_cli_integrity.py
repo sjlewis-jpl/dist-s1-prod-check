@@ -306,7 +306,6 @@ def test_f10_fixture_seeds_choose_different_products() -> None:
 
 
 # aa2014f: seeds 7 and 9 sample the same product (random_state hard-coded 42); sections carry no state/n_universe.
-@pytest.mark.xfail(strict=True, reason='F10: --sample-inputs ignores --seed and is not disclosed per section')
 def test_f10_sampling_disclosed_and_seeded(tmp_path: Path, cli_runner: CliRunner) -> None:
     inputs7, html7, data7 = _sampled_run(cli_runner, tmp_path, 7)
     inputs9, _, _ = _sampled_run(cli_runner, tmp_path, 9)
@@ -323,6 +322,20 @@ def test_f10_sampling_disclosed_and_seeded(tmp_path: Path, cli_runner: CliRunner
     subtitle = data7['subtitle'].lower()
     assert 'sample' in subtitle and 'seed 7' in subtitle, data7['subtitle']
     assert 'expect-none-at-start' in html7.lower()
+
+
+def test_f10_sample_tiles_disclosed_with_actual_count(
+    tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner
+) -> None:
+    seed_data_dir(tmp_data_dir, *_world(), target_tiles=[TILE])
+    out_dir = tmp_path / 'out'
+    result = _run_all(cli_runner, tmp_data_dir, out_dir, '--sample-tiles', '5', '--seed', '3')
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    _, data = _report(out_dir)
+    assert 'sample of 1 of 1 tiles (seed 3)' in data['subtitle']
+    assert {s['state'] for s in data['sections']} == {'SAMPLED'}
+    sampling = json.loads((out_dir / 'run_manifest.json').read_text())['sampling']
+    assert (sampling['tiles']['n_selected'], sampling['tiles']['seed']) == (1, 3)
 
 
 # ---------------------------------------------------------------------------------------------------------------

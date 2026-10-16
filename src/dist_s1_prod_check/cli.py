@@ -1,3 +1,4 @@
+import hashlib
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -222,6 +223,19 @@ class _Run:
         except Exception as report_exc:  # noqa: BLE001
             click.echo(f'Could not write the partial report: {type(report_exc).__name__}: {report_exc}', err=True)
         return False
+
+
+def _sampling_record(n_universe: int, selected: 'pd.Series | list[str]', seed: int, unit: str) -> dict:
+    """Describe a sample for the run manifest: sizes, seed and a digest of the selected ids."""
+    ids = sorted(map(str, selected))
+    digest = hashlib.sha256('\n'.join(ids).encode()).hexdigest()
+    return {
+        'n_universe': int(n_universe),
+        'n_selected': len(ids),
+        'seed': seed,
+        'unit': unit,
+        'selected_sha256': digest,
+    }
 
 
 def _json_param(value: object) -> object:
@@ -839,9 +853,12 @@ def check_inputs(
     def build(run: _Run) -> tuple[list[dict], dict[str, pd.DataFrame]]:
         df_dist = _load_dist_checked(data_dir, run)
         df_tags = _load_tags(data_dir)
-        df_tags = df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)]
+        n_universe = len(df_tags := df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)])
+        state = SectionState.COMPLETE
         if sample:
             df_tags = df_tags.sample(n=min(sample, len(df_tags)), random_state=seed)
+            run.manifest.sampling['inputs'] = _sampling_record(n_universe, df_tags.opera_id, seed, 'products')
+            state = SectionState.SAMPLED
         df_frame = _build_rtc_frame(_load_rtc_checked(data_dir, run)[0], data_dir) if mode == 'offline' else None
         return _inputs_section(
             df_tags,
@@ -850,6 +867,8 @@ def check_inputs(
             workers,
             _wkt_by_tile(_all_tile_geoms()),
             checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
+            state=state,
+            n_universe=n_universe,
         )
 
     _run_single_check(out_dir, 'inputs', 'DIST-S1 product inputs', build, regression_baseline)
@@ -980,10 +999,13 @@ def run_all(
             df_dist = df_dist[in_window].reset_index(drop=True)
         if processing_start or processing_stop:
             df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
+        tile_note = ''
         if sample_tiles:
             all_tiles = pd.Series(sorted(df_dist.mgrs_tile_id.unique()))
             keep = set(all_tiles.sample(n=min(sample_tiles, len(all_tiles)), random_state=seed))
             df_dist = df_dist[df_dist.mgrs_tile_id.isin(keep)].reset_index(drop=True)
+            run.manifest.sampling['tiles'] = _sampling_record(len(all_tiles), sorted(keep), seed, 'tiles')
+            tile_note = f' - sample of {len(keep)} of {len(all_tiles)} tiles (seed {seed})'
             click.echo(f'Sampled {len(keep)} of {len(all_tiles)} tiles')
         click.echo(f'DIST-S1 products: {len(df_dist)}')
         df_rtc, m_rtc = _load_cached(
@@ -996,13 +1018,24 @@ def run_all(
         df_frame = build_rtc_input_frame(df_rtc, mgrs_tile_ids=frame_tiles)
 
         df_dedup = checks.deduplicate_products(df_dist)
-        df_tags_products = (
-            df_dedup if not sample_inputs else df_dedup.sample(n=min(sample_inputs, len(df_dedup)), random_state=42)
-        )
+        # Sampling selects the products whose tags are fetched (the expensive step), so it applies to both the
+        # confirmation and the inputs sections; the expected predecessor still comes from the full DIST table.
+        df_tags_products = df_dedup
+        product_note = ''
+        if sample_inputs:
+            df_tags_products = df_dedup.sample(n=min(sample_inputs, len(df_dedup)), random_state=seed)
+            record = _sampling_record(len(df_dedup), df_tags_products.opera_id, seed, 'products')
+            run.manifest.sampling |= {'confirmation': record, 'inputs': record}
+            product_note = (
+                f' - confirmation and inputs sampled: {len(df_tags_products)} of {len(df_dedup)} products (seed {seed})'
+            )
+        all_state = SectionState.SAMPLED if sample_tiles else SectionState.COMPLETE
+        tag_state = SectionState.SAMPLED if sample_tiles or sample_inputs else SectionState.COMPLETE
         run.subtitle = (
             f'{start} to {stop}'
             + (f' over {bbox}' if bbox else ' (global)')
-            + (f' - sample of {sample_tiles} tiles' if sample_tiles else '')
+            + tile_note
+            + product_note
             + (f' - {venue} venue' if venue != 'PROD' else '')
             + (
                 f' - processed {processing_start or "start"} to {processing_stop or "now"}'
@@ -1019,9 +1052,9 @@ def run_all(
 
         wkt_map = _wkt_by_tile(_all_tile_geoms())
         builds = {
-            'duplicates': lambda: _duplicates_section(df_dist, wkt_map),
-            'ordering': lambda: _ordering_section(df_dedup, wkt_map),
-            'confirmation': lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map),
+            'duplicates': lambda: _duplicates_section(df_dist, wkt_map, all_state),
+            'ordering': lambda: _ordering_section(df_dedup, wkt_map, all_state),
+            'confirmation': lambda: _confirmation_section(df_dedup, df_tags, expect_none_at_start, wkt_map, tag_state),
             'inputs': lambda: _inputs_section(
                 df_tags,
                 df_frame,
@@ -1029,9 +1062,11 @@ def run_all(
                 inputs_workers,
                 wkt_map,
                 checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
+                state=tag_state,
+                n_universe=len(df_dedup),
             ),
             'coverage': lambda: _coverage_section(
-                df_dedup, df_frame, start, stop, wkt_map, query_windows=m_rtc.lookback_windows
+                df_dedup, df_frame, start, stop, wkt_map, all_state, query_windows=m_rtc.lookback_windows
             ),
         }
         for key in RUN_ALL_CHECKS:
