@@ -383,8 +383,9 @@ def _write_dist(
     stop: str,
     bbox: tuple | None,
     dist_bbox: tuple | None,
+    chunks: list[dict] | None = None,
 ) -> None:
-    """Write the DIST-S1 table and its query receipt (the query just ran to completion)."""
+    """Write the DIST-S1 table and its query receipt (the query just ran to completion), with its query chunks."""
     path = data_dir / DIST_S1_PARQUET
     df_dist.to_parquet(path, compression='zstd')
     manifest.write_table_manifest(
@@ -398,6 +399,7 @@ def _write_dist(
         query_bbox=dist_bbox,
         target_tiles=_load_target_tiles(data_dir),
         lookback_windows=manifest.windows_with_counts([(start, stop)], df_dist.acq_time),
+        chunks=chunks,
     )
 
 
@@ -410,6 +412,7 @@ def _write_rtc(
     bbox: tuple | None,
     rtc_bbox: tuple | None,
     lookback: bool = True,
+    chunks: list[dict] | None = None,
 ) -> None:
     """Write the RTC-S1 table and its query receipt, recording every window queried (main and lookback)."""
     path = data_dir / RTC_S1_PARQUET
@@ -425,6 +428,7 @@ def _write_rtc(
         query_bbox=rtc_bbox,
         target_tiles=_load_target_tiles(data_dir),
         lookback_windows=manifest.windows_with_counts(_rtc_ranges(start, stop, lookback), df_rtc.acq_dt),
+        chunks=chunks,
     )
     shutil.rmtree(chunks_dir, ignore_errors=True)
 
@@ -492,25 +496,35 @@ def download_metadata(
     dist_bbox, rtc_bbox = _resolve_bboxes(bbox, data_dir)
 
     manifest.manifest_path(data_dir / DIST_S1_PARQUET).unlink(missing_ok=True)
+    dist_chunks: list[dict] = []
     df_dist = cmr.get_dist_s1_table(
-        start, stop, bbox=dist_bbox, chunk_days=max(chunk_days, 7), max_workers=workers, venue=venue
+        start,
+        stop,
+        bbox=dist_bbox,
+        chunk_days=max(chunk_days, 7),
+        max_workers=workers,
+        venue=venue,
+        chunk_log=dist_chunks,
     )
-    _write_dist(df_dist, data_dir, venue, start, stop, bbox, dist_bbox)
+    _write_dist(df_dist, data_dir, venue, start, stop, bbox, dist_bbox, dist_chunks)
     click.echo(f'DIST-S1: {len(df_dist)} granules -> {data_dir / DIST_S1_PARQUET}')
 
     if skip_rtc:
         return
     chunks_dir = _rtc_chunks_dir(data_dir, rtc_bbox)
     manifest.manifest_path(data_dir / RTC_S1_PARQUET).unlink(missing_ok=True)
-    if lookback:
-        df_rtc = cmr.get_rtc_s1_table_with_lookback(
-            start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers, cache_dir=chunks_dir
-        )
-    else:
-        df_rtc = cmr.get_rtc_s1_table(
-            start, stop, bbox=rtc_bbox, chunk_days=chunk_days, max_workers=workers, cache_dir=chunks_dir
-        )
-    _write_rtc(df_rtc, data_dir, chunks_dir, start, stop, bbox, rtc_bbox, lookback)
+    rtc_chunks: list[dict] = []
+    fetch = cmr.get_rtc_s1_table_with_lookback if lookback else cmr.get_rtc_s1_table
+    df_rtc = fetch(
+        start,
+        stop,
+        bbox=rtc_bbox,
+        chunk_days=chunk_days,
+        max_workers=workers,
+        cache_dir=chunks_dir,
+        chunk_log=rtc_chunks,
+    )
+    _write_rtc(df_rtc, data_dir, chunks_dir, start, stop, bbox, rtc_bbox, lookback, rtc_chunks)
     click.echo(f'RTC-S1: {len(df_rtc)} granules -> {data_dir / RTC_S1_PARQUET}')
 
 
@@ -1189,13 +1203,17 @@ def run_all(
             if refresh:
                 shutil.rmtree(chunks_dir, ignore_errors=True)
             if need_dist:
-                df_dist = cmr.get_dist_s1_table(start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue)
-                _write_dist(df_dist, data_dir, venue, start, stop, bbox, dist_bbox)
-            if need_rtc:
-                df_rtc = cmr.get_rtc_s1_table_with_lookback(
-                    start, stop, bbox=rtc_bbox, max_workers=cmr_workers, cache_dir=chunks_dir
+                dist_chunks: list[dict] = []
+                df_dist = cmr.get_dist_s1_table(
+                    start, stop, bbox=dist_bbox, max_workers=cmr_workers, venue=venue, chunk_log=dist_chunks
                 )
-                _write_rtc(df_rtc, data_dir, chunks_dir, start, stop, bbox, rtc_bbox)
+                _write_dist(df_dist, data_dir, venue, start, stop, bbox, dist_bbox, dist_chunks)
+            if need_rtc:
+                rtc_chunks: list[dict] = []
+                df_rtc = cmr.get_rtc_s1_table_with_lookback(
+                    start, stop, bbox=rtc_bbox, max_workers=cmr_workers, cache_dir=chunks_dir, chunk_log=rtc_chunks
+                )
+                _write_rtc(df_rtc, data_dir, chunks_dir, start, stop, bbox, rtc_bbox, chunks=rtc_chunks)
                 del df_rtc
         request = manifest.CacheRequest(venue, start, stop, bbox, check_bbox=True)
         df_dist, m_dist = _load_cached(data_dir, DIST_S1_PARQUET, run, request)

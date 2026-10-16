@@ -161,3 +161,13 @@ def test_layer_completeness_disclaimer(tmp_path: Path, tmp_data_dir: Path, comma
     html = next(out_dir.glob('report_*.html')).read_text()
     provenance = html[html.index('<details class="prov"') : html.index('</details>')]
     assert 'Layer completeness (GEN-METRIC, GEN-DIST-STATUS-ACQ) is not checked.' in provenance
+
+
+def test_f16_table_manifest_records_chunks(tmp_path: Path) -> None:
+    path = tmp_path / 'rtc_s1_products.parquet'
+    pd.DataFrame({'opera_id': ['a', 'b']}).to_parquet(path)
+    chunks = [{'start': '2026-01-01T00:00:00Z', 'stop': '2026-01-03T00:00:00Z', 'hits': 2, 'rows': 2}]
+    manifest.write_table_manifest(
+        path, table='rtc_s1', venue='PROD', source='PROD CMR', start='2026-01-01', stop='2026-01-03', chunks=chunks
+    )
+    assert manifest.load_table_manifest(path).chunks == chunks

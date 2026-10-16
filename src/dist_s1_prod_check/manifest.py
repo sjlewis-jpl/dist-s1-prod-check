@@ -141,6 +141,8 @@ class TableManifest:
     enumerator_version: str
     complete: bool
     provenance: str
+    # One record per CMR query chunk (query window, hits, rows, query time, reused); empty for adopted caches.
+    chunks: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -174,6 +176,7 @@ def write_table_manifest(
     provenance: str = QUERY_RECEIPT,
     query_time_utc: str | None = None,
     complete: bool = True,
+    chunks: list[dict] | None = None,
 ) -> TableManifest:
     """Write the manifest of a parquet that has just been written (receipt) or is being adopted.
 
@@ -201,6 +204,7 @@ def write_table_manifest(
         enumerator_version=enumerator_version(),
         complete=complete,
         provenance=provenance,
+        chunks=list(chunks or []),
     )
     path = manifest_path(parquet_path)
     tmp = path.with_suffix('.json.tmp')

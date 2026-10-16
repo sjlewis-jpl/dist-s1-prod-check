@@ -1,3 +1,4 @@
+import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -21,7 +22,9 @@ from shapely.geometry import box
 from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_random_exponential
 from tqdm import tqdm
 
+from dist_s1_prod_check import manifest
 from dist_s1_prod_check.constants import (
+    CHUNK_SCHEMA_VERSION,
     CMR_GRANULES_URL,
     CMR_GRANULES_URLS,
     CMR_PAGE_SIZE,
@@ -33,6 +36,7 @@ from dist_s1_prod_check.constants import (
     DIST_S1_S3_REGION,
     DUAL_POLARIZATIONS,
     LAYER_URL_MAP,
+    MUTABLE_RECENT_DAYS,
     RTC_S1_CONCEPT_ID,
 )
 from dist_s1_prod_check.ids import get_opera_id_trunc, get_track_number
@@ -186,38 +190,61 @@ def _search_chunked_to_df(
     desc: str = 'CMR chunks',
     cmr_url: str = CMR_GRANULES_URL,
     cache_dir: Path | None = None,
+    chunk_log: list[dict] | None = None,
 ) -> pd.DataFrame:
     """Chunked CMR search where each chunk is converted to a compact DataFrame as it completes.
 
     Peak memory is bounded by the final concatenated table plus one in-flight chunk per worker,
     never the whole corpus as python dicts. With `cache_dir`, each chunk is checkpointed to parquet
-    and reused on rerun, so an interrupted download resumes instead of starting over.
+    with a manifest (`<chunk>.manifest.json`: query parameters, query time, hits, rows, schema version), and
+    reused on rerun only if `_reusable_chunk` accepts it (F16), so an interrupted download resumes instead of
+    starting over. With `chunk_log`, one record per chunk (its manifest plus ``reused``) is appended.
     """
     chunks = _date_chunks(start_time, stop_time, chunk_days)
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> pd.DataFrame:
+    def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> tuple[pd.DataFrame, dict]:
+        query = {
+            'concept_id': collection_concept_id,
+            'start': manifest._iso(chunk[0]),
+            'stop': manifest._iso(chunk[1]),
+            'bbox': [float(v) for v in bbox] if bbox is not None else None,
+            'cmr_url': cmr_url,
+            'schema_version': CHUNK_SCHEMA_VERSION,
+        }
         path = None
         if cache_dir is not None:
             path = cache_dir / f'{collection_concept_id}_{chunk[0]:%Y%m%dT%H%M%S}_{chunk[1]:%Y%m%dT%H%M%S}.parquet'
-            if path.exists():
-                return pd.read_parquet(path)
+            cached = _reusable_chunk(path, query)
+            if cached is not None:
+                return cached
         records = search_granules(
             collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
         )
         df_chunk = pd.DataFrame(records)
+        record = {
+            **query,
+            'query_time_utc': manifest.now_utc(),
+            'hits': getattr(records, 'hits', None),
+            'rows': len(df_chunk),
+            'complete': True,
+        }
         if path is not None:
             tmp = path.with_suffix('.tmp')
             df_chunk.to_parquet(tmp, compression='zstd')
             tmp.replace(path)
-        return df_chunk
+            # The manifest is written last: a chunk parquet without one is an interrupted write and never reused.
+            _write_json(_chunk_manifest_path(path), record)
+        return df_chunk, {**record, 'reused': False}
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
             frames = []
             n_granules = 0
-            for df_chunk in pool.map(_one, chunks):
+            for df_chunk, record in pool.map(_one, chunks):
+                if chunk_log is not None:
+                    chunk_log.append(record)
                 if not df_chunk.empty:
                     frames.append(df_chunk)
                     n_granules += len(df_chunk)
@@ -226,6 +253,42 @@ def _search_chunked_to_df(
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _chunk_manifest_path(path: Path) -> Path:
+    return path.with_name(path.name.removesuffix('.parquet') + '.manifest.json')
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(payload, indent=2) + '\n')
+    tmp.replace(path)
+
+
+def _reusable_chunk(path: Path, query: dict) -> tuple[pd.DataFrame, dict] | None:
+    """Return a cached chunk and its manifest record if it may be reused for `query`, else None (F16).
+
+    Reused only if the parquet and its manifest both exist, the manifest is complete, records exactly `query`
+    (collection, window, bbox, CMR URL, schema version) and the parquet's row count, and the chunk's stop lies
+    at least `MUTABLE_RECENT_DAYS` before its query time (recent acquisitions are still changing).
+    """
+    mpath = _chunk_manifest_path(path)
+    if not (path.exists() and mpath.exists()):
+        return None
+    try:
+        record = json.loads(mpath.read_text())
+    except (OSError, ValueError):
+        return None
+    if not record.get('complete') or any(record.get(k) != v for k, v in query.items()):
+        return None
+    query_time = record.get('query_time_utc')
+    recent = pd.Timedelta(days=MUTABLE_RECENT_DAYS)
+    if query_time is None or manifest._utc(query['stop']) + recent > manifest._utc(query_time):
+        return None
+    df_chunk = pd.read_parquet(path)
+    if len(df_chunk) != record.get('rows'):
+        return None
+    return df_chunk, {**record, 'reused': True}
 
 
 def resolve_target_tiles(
@@ -304,11 +367,28 @@ def get_dist_s1_table(
     chunk_days: int = 7,
     max_workers: int = 8,
     venue: str = 'PROD',
+    chunk_log: list[dict] | None = None,
 ) -> gpd.GeoDataFrame:
-    """Download DIST-S1 granule metadata from CMR (or a venue's S3 bucket) into a GeoDataFrame with MGRS footprints."""
+    """Download DIST-S1 granule metadata from CMR (or a venue's S3 bucket) into a GeoDataFrame with MGRS footprints.
+
+    With `chunk_log`, one record per CMR chunk (or one for the whole S3 listing) is appended for the table manifest.
+    """
     if venue in DIST_S1_S3_BUCKETS:
         df = _list_dist_s1_s3(start_time, stop_time, DIST_S1_S3_BUCKETS[venue], max_workers=max_workers)
         source = f's3://{DIST_S1_S3_BUCKETS[venue]}/{DIST_S1_S3_PREFIX}'
+        if chunk_log is not None:
+            chunk_log.append(
+                {
+                    'source': source,
+                    'start': manifest._iso(start_time),
+                    'stop': manifest._iso(stop_time),
+                    'query_time_utc': manifest.now_utc(),
+                    'hits': None,
+                    'rows': len(df),
+                    'complete': True,
+                    'reused': False,
+                }
+            )
     else:
         token = token or get_edl_token(venue)
         df = _search_chunked_to_df(
@@ -322,6 +402,7 @@ def get_dist_s1_table(
             max_workers=max_workers,
             desc=f'DIST-S1 CMR ({venue})',
             cmr_url=CMR_GRANULES_URLS[venue],
+            chunk_log=chunk_log,
         )
         source = 'CMR; check the Earthdata credentials'
     if df.empty:
@@ -417,6 +498,7 @@ def get_rtc_s1_table(
     chunk_days: int = 2,
     max_workers: int = 8,
     cache_dir: Path | None = None,
+    chunk_log: list[dict] | None = None,
 ) -> gpd.GeoDataFrame:
     """Download RTC-S1 granule metadata from CMR into a GeoDataFrame with burst footprints."""
     df = _search_chunked_to_df(
@@ -429,6 +511,7 @@ def get_rtc_s1_table(
         max_workers=max_workers,
         desc='RTC-S1 CMR',
         cache_dir=cache_dir,
+        chunk_log=chunk_log,
     )
     if df.empty:
         raise RuntimeError('No RTC-S1 granules returned; check the time range.')
@@ -465,9 +548,12 @@ def get_rtc_s1_table_with_lookback(
     chunk_days: int = 2,
     max_workers: int = 8,
     cache_dir: Path | None = None,
+    chunk_log: list[dict] | None = None,
 ) -> gpd.GeoDataFrame:
     tables = [
-        get_rtc_s1_table(t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers, cache_dir=cache_dir)
+        get_rtc_s1_table(
+            t0, t1, bbox=bbox, chunk_days=chunk_days, max_workers=max_workers, cache_dir=cache_dir, chunk_log=chunk_log
+        )
         for t0, t1 in lookback_date_ranges(start_time, stop_time, delta_lookback_days, delta_window_days)
     ]
     df = pd.concat(tables).drop_duplicates(subset='opera_id')

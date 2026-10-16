@@ -123,7 +123,6 @@ def _umm_item(opera_id: str) -> dict:
 
 
 # aa2014f: the interrupted run's chunk parquet was reused; CMR was queried 0 times and the fresh granule is absent
-@pytest.mark.xfail(strict=True, reason='F16: chunk checkpoints without a manifest are reused on resume')
 def test_f16_chunk_checkpoint_without_manifest_is_not_reused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     start, stop = pd.Timestamp('2026-01-01'), pd.Timestamp('2026-01-03')
     stale_id = rtc_id(BURST, '2026-01-02T02:06:53', '2026-01-02T07:00:00')
@@ -194,3 +193,56 @@ def test_f14_s3_product_without_status_key_has_no_alert_url(monkeypatch: pytest.
     assert df.alert_url[complete].endswith(f'{complete}/{complete}_GEN-DIST-STATUS.tif')
     assert df.alert_url.isna()[partial] and df.alert_acq_url.isna()[partial]
     assert df.metric_url[partial].endswith('_GEN-METRIC.tif')
+
+
+def _fake_chunk_search(queries: list[tuple], ids: list[str]) -> Callable[..., list[dict]]:
+    def fake_search(
+        concept_id: str, t0: pd.Timestamp, t1: pd.Timestamp, parse_fn: Callable[[dict], dict], **kwargs: object
+    ) -> list[dict]:
+        queries.append((concept_id, t0, t1, kwargs.get('bbox')))
+        result = cmr.GranuleList(parse_fn(_umm_item(i)) for i in ids)
+        result.hits = len(ids)
+        return result
+
+    return fake_search
+
+
+@pytest.mark.parametrize(
+    ('case', 'n_queries'),
+    [('same_query', 1), ('recent_chunk', 2), ('other_bbox', 2), ('rows_differ', 2), ('other_schema', 2)],
+)
+def test_f16_chunk_reuse_needs_matching_manifest(
+    case: str, n_queries: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    start = pd.Timestamp('2026-01-01')
+    if case == 'recent_chunk':
+        start = pd.Timestamp.now().normalize() - pd.Timedelta(days=10)
+    stop = start + pd.Timedelta(days=2)
+    ids = [rtc_id(BURST, start + pd.Timedelta(hours=2), start + pd.Timedelta(hours=7))]
+    queries: list[tuple] = []
+    monkeypatch.setattr(cmr, 'search_granules', _fake_chunk_search(queries, ids))
+    cache_dir = tmp_path / 'chunks'
+    bbox = (-120.0, 34.0, -118.0, 36.0)
+
+    log: list[dict] = []
+    cmr.get_rtc_s1_table(start, stop, bbox=bbox, chunk_days=2, max_workers=1, cache_dir=cache_dir, chunk_log=log)
+    (mpath,) = cache_dir.glob('*.manifest.json')
+    record = json.loads(mpath.read_text())
+    assert (record['hits'], record['rows'], record['complete']) == (1, 1, True)
+    assert log == [{**record, 'reused': False}]
+    if case == 'rows_differ':
+        mpath.write_text(json.dumps({**record, 'rows': 2}))
+    if case == 'other_schema':
+        mpath.write_text(json.dumps({**record, 'schema_version': record['schema_version'] - 1}))
+    rerun_bbox = (-121.0, 34.0, -118.0, 36.0) if case == 'other_bbox' else bbox
+
+    log2: list[dict] = []
+    df = cmr.get_rtc_s1_table(
+        start, stop, bbox=rerun_bbox, chunk_days=2, max_workers=1, cache_dir=cache_dir, chunk_log=log2
+    )
+
+    assert len(queries) == n_queries, f'{case}: CMR queried {len(queries)} times'
+    assert log2[0]['reused'] is (n_queries == 1)
+    assert df.opera_id.tolist() == ids

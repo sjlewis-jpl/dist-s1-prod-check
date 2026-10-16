@@ -37,6 +37,11 @@ DEFAULT_CMR_WORKERS = 8
 DIST_S1_PARQUET = 'dist_s1_products.parquet'
 RTC_S1_PARQUET = 'rtc_s1_products.parquet'
 RTC_CHUNKS_DIR = 'rtc_s1_chunks'  # per-chunk CMR checkpoints, removed once RTC_S1_PARQUET is written
+# A chunk checkpoint is reused on resume only if its manifest matches (F16). Recent acquisitions are still being
+# processed and ingested, so a chunk whose stop is less than MUTABLE_RECENT_DAYS before its query time is always
+# re-queried. Bump CHUNK_SCHEMA_VERSION whenever a granule parser's output columns change.
+MUTABLE_RECENT_DAYS = 30
+CHUNK_SCHEMA_VERSION = 1
 TAGS_PARQUET = 'dist_s1_tags.parquet'
 INPUTS_CHECKPOINT_PARQUET = 'inputs_check_results.parquet'
 TARGET_TILES_FILE = 'target_mgrs_tiles.txt'
