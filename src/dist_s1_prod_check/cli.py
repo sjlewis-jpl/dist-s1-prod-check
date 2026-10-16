@@ -51,9 +51,30 @@ def _load_cached(
     return gpd.read_parquet(path), m
 
 
-def _load_dist_checked(data_dir: Path, run: '_Run') -> gpd.GeoDataFrame:
-    """DIST-S1 table for a standalone check command (no window or AOI to match)."""
+def _filter_versions(df_dist: gpd.GeoDataFrame, product_versions: str, run: '_Run | None') -> gpd.GeoDataFrame:
+    """Keep the allowed product versions (decision 6) and record what was excluded in the run manifest."""
+    allowed = [v.strip() for v in product_versions.split(',') if v.strip()]
+    df_kept, excluded = checks.filter_product_versions(df_dist, allowed)
+    n_excluded = sum(excluded.values())
+    if run is not None:
+        run.manifest.version_filter = {'allowed': allowed, 'n_excluded': n_excluded, 'excluded_by_version': excluded}
+    click.echo(f'Product-version filter ({", ".join(allowed)}) kept {len(df_kept)} of {len(df_dist)} DIST-S1 products')
+    return df_kept
+
+
+def _version_note(run: '_Run') -> str:
+    vf = run.manifest.version_filter
+    if not vf.get('n_excluded'):
+        return ''
+    detail = ', '.join(f'{v}: {n}' for v, n in vf['excluded_by_version'].items())
+    return f' - excluded {vf["n_excluded"]} products of other versions ({detail})'
+
+
+def _load_dist_checked(data_dir: Path, run: '_Run', product_versions: str) -> gpd.GeoDataFrame:
+    """DIST-S1 table for a standalone check command (no window or AOI to match), version-filtered."""
     df, _ = _load_cached(data_dir, DIST_S1_PARQUET, run, manifest.CacheRequest(venue=_venue_of(data_dir) or 'PROD'))
+    df = _filter_versions(df, product_versions, run)
+    run.subtitle = _version_note(run).removeprefix(' - ')
     return df
 
 
@@ -276,6 +297,12 @@ def _run_single_check(
 
 RUN_ALL_CHECKS = ('duplicates', 'ordering', 'confirmation', 'inputs', 'coverage')
 
+product_versions_option = click.option(
+    '--product-versions',
+    default='v1.0',
+    show_default=True,
+    help='Comma-separated DIST-S1 product versions to check; other versions are excluded and counted in the report.',
+)
 regression_option = click.option(
     '--regression-baseline',
     is_flag=True,
@@ -518,10 +545,13 @@ tag_url_template_option = click.option(
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
 @click.option('--seed', type=int, default=42, show_default=True)
 @tag_url_template_option
+@product_versions_option
 @data_dir_option
-def fetch_tags(workers: int, sample: int, seed: int, tag_url_template: str | None, data_dir: Path) -> None:
+def fetch_tags(
+    workers: int, sample: int, seed: int, tag_url_template: str | None, product_versions: str, data_dir: Path
+) -> None:
     """Fetch product GeoTIFF tags (inputs, prior product) from the DAAC; resumable."""
-    df_dist = checks.deduplicate_products(_load_dist(data_dir))
+    df_dist = checks.deduplicate_products(_filter_versions(_load_dist(data_dir), product_versions, None))
     if sample:
         df_dist = df_dist.sample(n=min(sample, len(df_dist)), random_state=seed)
     df_tags = tags.fetch_tags_table(
@@ -783,32 +813,37 @@ def _coverage_section(
 
 
 @cli.command()
+@product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
-def check_duplicates(data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
+def check_duplicates(data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str) -> None:
     """Check for duplicated DIST-S1 products (check 2)."""
     _run_single_check(
         out_dir,
         'duplicates',
         'DIST-S1 duplicates',
-        lambda run: _duplicates_section(_load_dist_checked(data_dir, run), _wkt_by_tile(_all_tile_geoms())),
+        lambda run: _duplicates_section(
+            _load_dist_checked(data_dir, run, product_versions), _wkt_by_tile(_all_tile_geoms())
+        ),
         regression_baseline,
     )
 
 
 @cli.command()
+@product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
-def check_ordering(data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
+def check_ordering(data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str) -> None:
     """Check processing order matches acquisition order (check 3)."""
     _run_single_check(
         out_dir,
         'ordering',
         'DIST-S1 processing order',
         lambda run: _ordering_section(
-            checks.deduplicate_products(_load_dist_checked(data_dir, run)), _wkt_by_tile(_all_tile_geoms())
+            checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions)),
+            _wkt_by_tile(_all_tile_geoms()),
         ),
         regression_baseline,
     )
@@ -818,17 +853,20 @@ def check_ordering(data_dir: Path, out_dir: Path, regression_baseline: bool) -> 
 @click.option(
     '--expect-none-at-start', is_flag=True, help='Require the first product per tile to have no prior (mission start).'
 )
+@product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
-def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
+def check_confirmation(
+    expect_none_at_start: bool, data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str
+) -> None:
     """Check the confirmation chain via prior product tags (check 4)."""
     _run_single_check(
         out_dir,
         'confirmation',
         'DIST-S1 confirmation chain',
         lambda run: _confirmation_section(
-            checks.deduplicate_products(_load_dist_checked(data_dir, run)),
+            checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions)),
             _load_tags(data_dir),
             expect_none_at_start,
             _wkt_by_tile(_all_tile_geoms()),
@@ -842,16 +880,24 @@ def check_confirmation(expect_none_at_start: bool, data_dir: Path, out_dir: Path
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
 @click.option('--seed', type=int, default=42, show_default=True)
 @click.option('--workers', type=int, default=8, show_default=True)
+@product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
 def check_inputs(
-    mode: str, sample: int, seed: int, workers: int, data_dir: Path, out_dir: Path, regression_baseline: bool
+    mode: str,
+    sample: int,
+    seed: int,
+    workers: int,
+    data_dir: Path,
+    out_dir: Path,
+    regression_baseline: bool,
+    product_versions: str,
 ) -> None:
     """Check product inputs against re-enumerated expected inputs (check 5)."""
 
     def build(run: _Run) -> tuple[list[dict], dict[str, pd.DataFrame]]:
-        df_dist = _load_dist_checked(data_dir, run)
+        df_dist = _load_dist_checked(data_dir, run, product_versions)
         df_tags = _load_tags(data_dir)
         n_universe = len(df_tags := df_tags[df_tags.opera_id.isin(checks.deduplicate_products(df_dist).opera_id)])
         state = SectionState.COMPLETE
@@ -875,9 +921,9 @@ def check_inputs(
 
 
 def _check_coverage_standalone(
-    run: _Run, data_dir: Path, start: str, stop: str
+    run: _Run, data_dir: Path, start: str, stop: str, product_versions: str
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
-    df_dedup = checks.deduplicate_products(_load_dist_checked(data_dir, run))
+    df_dedup = checks.deduplicate_products(_load_dist_checked(data_dir, run, product_versions))
     df_rtc, m_rtc = _load_rtc_checked(data_dir, run, start, stop)
     return _coverage_section(
         df_dedup,
@@ -892,16 +938,19 @@ def _check_coverage_standalone(
 @cli.command()
 @click.option('--start', required=True)
 @click.option('--stop', required=True)
+@product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
-def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path, regression_baseline: bool) -> None:
+def check_coverage(
+    start: str, stop: str, data_dir: Path, out_dir: Path, regression_baseline: bool, product_versions: str
+) -> None:
     """Check all triggerable DIST-S1 products exist given available RTC-S1 inputs (check 6)."""
     _run_single_check(
         out_dir,
         'coverage',
         'DIST-S1 coverage',
-        lambda run: _check_coverage_standalone(run, data_dir, start, stop),
+        lambda run: _check_coverage_standalone(run, data_dir, start, stop, product_versions),
         regression_baseline,
     )
 
@@ -940,6 +989,7 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path, regress
 @click.option('--processing-stop', default=None, help='Only check DIST-S1 products processed before this time.')
 @tag_url_template_option
 @venue_option
+@product_versions_option
 @regression_option
 @data_dir_option
 @out_dir_option
@@ -960,6 +1010,7 @@ def run_all(
     tag_url_template: str | None,
     venue: str,
     regression_baseline: bool,
+    product_versions: str,
     data_dir: Path,
     out_dir: Path,
 ) -> None:
@@ -992,13 +1043,21 @@ def run_all(
                 del df_rtc
         request = manifest.CacheRequest(venue, start, stop, bbox, check_bbox=True)
         df_dist, m_dist = _load_cached(data_dir, DIST_S1_PARQUET, run, request)
+        df_dist = _filter_versions(df_dist, product_versions, run)
         if manifest.strictly_inside(m_dist, start, stop):
             acq = pd.to_datetime(df_dist.acq_time, utc=True)
             in_window = (acq >= manifest._utc(start)) & (acq < manifest._utc(stop))
             click.echo(f'Window filter kept {int(in_window.sum())} of {len(df_dist)} cached DIST-S1 products')
             df_dist = df_dist[in_window].reset_index(drop=True)
         if processing_start or processing_stop:
+            n_before = len(df_dist)
             df_dist = _filter_processing_time(df_dist, processing_start, processing_stop)
+            run.manifest.processing_filter = {
+                'start': processing_start,
+                'stop': processing_stop,
+                'n_before': n_before,
+                'n_kept': len(df_dist),
+            }
         tile_note = ''
         if sample_tiles:
             all_tiles = pd.Series(sorted(df_dist.mgrs_tile_id.unique()))
@@ -1036,6 +1095,7 @@ def run_all(
             + (f' over {bbox}' if bbox else ' (global)')
             + tile_note
             + product_note
+            + _version_note(run)
             + (f' - {venue} venue' if venue != 'PROD' else '')
             + (
                 f' - processed {processing_start or "start"} to {processing_stop or "now"}'

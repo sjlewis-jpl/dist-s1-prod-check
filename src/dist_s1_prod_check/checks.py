@@ -3,9 +3,26 @@ import pandas as pd
 from dist_s1_prod_check.ids import get_opera_id_trunc
 
 
+# Deterministic order within a tile/acquisition group: last processed wins, ties broken by the full opera_id.
+VERSION_ORDER = ['opera_dedup_id', 'processing_time', 'opera_id']
+
+
+def product_version(opera_id: str) -> str:
+    """Product version token of a DIST-S1 id, e.g. ``v1.0``."""
+    return opera_id.rsplit('_', 1)[-1]
+
+
+def filter_product_versions(df_dist: pd.DataFrame, allowed: list[str]) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Keep products whose version is in `allowed`; return them and the number excluded per other version."""
+    versions = df_dist.opera_id.map(product_version)
+    keep = versions.isin(allowed)
+    excluded = {str(v): int(n) for v, n in versions[~keep].value_counts().sort_index().items()}
+    return df_dist[keep].reset_index(drop=True), excluded
+
+
 def deduplicate_products(df_dist: pd.DataFrame) -> pd.DataFrame:
-    """Keep one product per tile/acquisition: the one processed last."""
-    df = df_dist.sort_values(['opera_dedup_id', 'processing_time']).copy()
+    """Keep one product per tile/acquisition: the one processed last (ties: the greatest opera_id)."""
+    df = df_dist.sort_values(VERSION_ORDER, kind='stable').copy()
     df['n_versions'] = df.groupby('opera_dedup_id')['opera_id'].transform('size')
     df = df[~df.duplicated(subset='opera_dedup_id', keep='last')]
     return df.sort_values(['mgrs_tile_id', 'acq_time']).reset_index(drop=True)
@@ -18,7 +35,7 @@ def check_duplicates(df_dist: pd.DataFrame) -> pd.DataFrame:
     superseded.
     """
     dup_mask = df_dist.duplicated(subset='opera_dedup_id', keep=False)
-    df_dup = df_dist[dup_mask].sort_values(['opera_dedup_id', 'processing_time']).copy()
+    df_dup = df_dist[dup_mask].sort_values(VERSION_ORDER, kind='stable').copy()
     cols = [
         'opera_id',
         'mgrs_tile_id',

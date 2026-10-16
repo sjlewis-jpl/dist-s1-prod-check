@@ -7,9 +7,10 @@ import pytest
 import requests
 from click.testing import CliRunner
 
+from dist_s1_prod_check import checks
 from dist_s1_prod_check import cli as cli_module
 from dist_s1_prod_check.cli import cli
-from factories import dist_id, make_dist, make_tags, seed_data_dir
+from factories import bursts_for_tile, dist_id, make_dist, make_rtc, make_tags, seed_data_dir
 
 
 TILE = '10SGC'
@@ -143,3 +144,45 @@ def test_f08_retained_view_reports_not_evaluated(
     counts = [(s['key'], s.get('n_checked'), s.get('n_skipped')) for s in ordering]
     # Retained view: A is first in the tile and B is reprocessed, so only C is evaluated.
     assert ('ordering', 1, 2) in counts or ('ordering_retained', 1, 2) in counts, counts
+
+
+# --- Task 1.6: product-version filter and deterministic deduplication -----------------------------------------------
+
+
+def test_dedup_tie_broken_by_opera_id() -> None:
+    acq, proc = pd.Timestamp('2026-01-02T02:06:53'), pd.Timestamp('2026-01-03T00:00:00')
+    rows = [{'opera_id': dist_id('10SGC', acq, proc, sensor=s)} for s in ('S1C', 'S1A')]
+    for order in (rows, rows[::-1]):
+        df = make_dist(order)
+        assert checks.deduplicate_products(df).opera_id.tolist() == [rows[0]['opera_id']]
+        dup = checks.check_duplicates(df)
+        assert set(dup.latest_opera_id) == {rows[0]['opera_id']}
+
+
+def test_filter_product_versions_counts_exclusions() -> None:
+    acq = pd.Timestamp('2026-01-02T02:06:53')
+    ids = [dist_id('10SGC', acq + pd.Timedelta(days=12 * k), acq + pd.Timedelta(days=12 * k + 1)) for k in range(2)]
+    ids.append(dist_id('10SGC', acq, acq + pd.Timedelta(days=90), version='v0.1'))
+    kept, excluded = checks.filter_product_versions(make_dist([{'opera_id': i} for i in ids]), ['v1.0'])
+    assert kept.opera_id.tolist() == ids[:2]
+    assert excluded == {'v0.1': 1}
+    kept, excluded = checks.filter_product_versions(make_dist([{'opera_id': i} for i in ids]), ['v1.0', 'v0.1'])
+    assert len(kept) == 3 and excluded == {}
+
+
+def test_run_all_excludes_other_versions(tmp_path: Path, tmp_data_dir: Path, cli_runner: CliRunner) -> None:
+    acq = pd.Timestamp('2026-01-02T02:06:53')
+    v1 = dist_id('10SGC', acq, acq + pd.Timedelta(days=1))
+    v01 = dist_id('10SGC', acq, acq + pd.Timedelta(days=2), version='v0.1')
+    tags = make_tags([{'opera_id': v1, 'prior_dist_s1_product': 'None'}])
+    rtc = make_rtc([{'burst': bursts_for_tile('10SGC').jpl_burst_id.iloc[0], 'acq': acq, 'proc': acq}])
+    seed_data_dir(tmp_data_dir, dist=make_dist([{'opera_id': v1}, {'opera_id': v01}]), rtc=rtc, tags=tags)
+    out_dir = tmp_path / 'out'
+    args = ['run-all', '--start', '2026-01-01', '--stop', '2026-03-01', '--inputs-workers', '1']
+    result = cli_runner.invoke(cli, [*args, '--data-dir', str(tmp_data_dir), '--out-dir', str(out_dir)])
+    assert result.exit_code == 0, result.output + repr(result.exception)
+    html = next(out_dir.glob('report_*.html')).read_text()
+    assert 'excluded 1 products of other versions (v0.1: 1)' in html
+    assert v01 not in html
+    duplicates = pd.read_csv(next(out_dir.glob('duplicates_*.csv')))
+    assert duplicates.empty, 'the v0.1 product must not form a duplicate group with the v1.0 one'
