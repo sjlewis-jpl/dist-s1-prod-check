@@ -716,16 +716,17 @@ def _coverage_section(
     stop: str,
     wkt_map: dict[str, str],
     state: SectionState = SectionState.COMPLETE,
+    query_windows: list[manifest.QueryWindow] | None = None,
 ) -> tuple[list[dict], dict[str, pd.DataFrame]]:
     df_groups = coverage.expected_pass_groups(df_frame, start, stop)
-    df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame)
-    df_missing = df_cov[~df_cov.product_found & df_cov.missing_product_expected]
+    df_cov = coverage.check_coverage(df_groups, df_dedup, df_rtc_frame=df_frame, query_windows=query_windows)
+    # FAIL (missing, baseline available) and UNKNOWN (lookback incomplete) passes both need attention.
+    df_missing = df_cov[df_cov.status.isin([Status.FAIL, Status.UNKNOWN])]
     df_missing = _append_tile_wkt(df_missing.drop(columns=['burst_ids', 'burst_pols'], errors='ignore'), wkt_map)
     df_missing['asf_search_url'] = [
         _vertex_search_url(row.mgrs_tile_wkt, row.post_acq_dt) for row in df_missing.itertuples()
     ]
     df_orphans = coverage.check_orphan_products(df_groups, df_dedup)
-    n_found = int(df_cov.product_found.sum()) if len(df_cov) else 0
 
     summary = None
     df_by_tile = pd.DataFrame(columns=['mgrs_tile_id', 'n_missing', 'missing_post_dates'])
@@ -747,15 +748,16 @@ def _coverage_section(
     section = report.build_section(
         'coverage',
         'Coverage',
-        'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none.',
+        'RTC-S1 passes with baseline imagery that should have triggered a DIST-S1 product but have none (FAIL), '
+        'and missing passes whose baseline windows were not all queried to completion (UNKNOWN).',
         df_missing,
-        n_found + len(df_missing),
+        int(df_cov.status.isin(EVALUATED).sum()),
         summary=summary,
         state=state,
         unit='passes',
         n_universe=len(df_cov),
-        n_skipped=len(df_cov) - n_found - len(df_missing),
-        counts={Status.PASS: n_found, Status.FAIL: len(df_missing)},
+        n_skipped=int((df_cov.status == Status.SKIPPED).sum()),
+        counts=df_cov.status.value_counts().to_dict(),
     )
     csvs = {
         'coverage_missing': df_missing,
@@ -853,6 +855,21 @@ def check_inputs(
     _run_single_check(out_dir, 'inputs', 'DIST-S1 product inputs', build, regression_baseline)
 
 
+def _check_coverage_standalone(
+    run: _Run, data_dir: Path, start: str, stop: str
+) -> tuple[list[dict], dict[str, pd.DataFrame]]:
+    df_dedup = checks.deduplicate_products(_load_dist_checked(data_dir, run))
+    df_rtc, m_rtc = _load_rtc_checked(data_dir, run, start, stop)
+    return _coverage_section(
+        df_dedup,
+        _build_rtc_frame(df_rtc, data_dir),
+        start,
+        stop,
+        _wkt_by_tile(_all_tile_geoms()),
+        query_windows=m_rtc.lookback_windows,
+    )
+
+
 @cli.command()
 @click.option('--start', required=True)
 @click.option('--stop', required=True)
@@ -865,13 +882,7 @@ def check_coverage(start: str, stop: str, data_dir: Path, out_dir: Path, regress
         out_dir,
         'coverage',
         'DIST-S1 coverage',
-        lambda run: _coverage_section(
-            checks.deduplicate_products(_load_dist_checked(data_dir, run)),
-            _build_rtc_frame(_load_rtc_checked(data_dir, run, start, stop)[0], data_dir),
-            start,
-            stop,
-            _wkt_by_tile(_all_tile_geoms()),
-        ),
+        lambda run: _check_coverage_standalone(run, data_dir, start, stop),
         regression_baseline,
     )
 
@@ -975,7 +986,7 @@ def run_all(
             df_dist = df_dist[df_dist.mgrs_tile_id.isin(keep)].reset_index(drop=True)
             click.echo(f'Sampled {len(keep)} of {len(all_tiles)} tiles')
         click.echo(f'DIST-S1 products: {len(df_dist)}')
-        df_rtc, _ = _load_cached(
+        df_rtc, m_rtc = _load_cached(
             data_dir, RTC_S1_PARQUET, run, manifest.CacheRequest('PROD', start, stop, bbox, check_bbox=True)
         )
         click.echo(f'RTC-S1 granules: {len(df_rtc)}')
@@ -1019,7 +1030,9 @@ def run_all(
                 wkt_map,
                 checkpoint_path=data_dir / INPUTS_CHECKPOINT_PARQUET,
             ),
-            'coverage': lambda: _coverage_section(df_dedup, df_frame, start, stop, wkt_map),
+            'coverage': lambda: _coverage_section(
+                df_dedup, df_frame, start, stop, wkt_map, query_windows=m_rtc.lookback_windows
+            ),
         }
         for key in RUN_ALL_CHECKS:
             run.stage(key)

@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 
 from dist_s1_prod_check.constants import DELTA_LOOKBACK_DAYS, DELTA_WINDOW_DAYS, DUAL_POLARIZATIONS
+from dist_s1_prod_check.manifest import QueryWindow, lookback_complete
+from dist_s1_prod_check.status import Status
 
 
 COVERAGE_COLUMNS = [
@@ -15,6 +17,7 @@ COVERAGE_COLUMNS = [
     'time_diff_seconds',
     'n_bursts_with_baseline',
     'missing_product_expected',
+    'status',
     'reason',
 ]
 ORPHAN_COLUMNS = ['opera_id', 'mgrs_tile_id', 'acq_time', 'nearest_pass_diff_seconds', 'reason']
@@ -96,11 +99,18 @@ def check_coverage(
     tolerance_seconds: int = 3600,
     delta_lookback_days: tuple[int, ...] = DELTA_LOOKBACK_DAYS,
     delta_window_days: int = DELTA_WINDOW_DAYS,
+    query_windows: list[QueryWindow] | None = None,
 ) -> pd.DataFrame:
     """Check every expected MGRS pass has a DIST-S1 product; missing passes are checked for baseline availability.
 
     A burst only counts as having a baseline when the lookback windows hold acquisitions of the same
     dual polarization as the post-image, matching how the enumerator builds a baseline.
+
+    `query_windows` are the RTC-S1 query windows from the table's manifest. A missing pass is judged only if
+    every baseline window it needs was queried to completion (`manifest.lookback_complete`); otherwise its
+    status is UNKNOWN ("lookback incomplete"), because an unqueried window is not evidence of "no baseline".
+    Without `query_windows` nothing is known to be complete. Status per pass: PASS (product found), FAIL
+    (missing, baseline available), SKIPPED (missing, no baseline: not expected), UNKNOWN (lookback incomplete).
     """
     df_dist = df_dist_dedup.copy()
     df_dist['acq_time_utc'] = _to_utc(df_dist.acq_time)
@@ -136,23 +146,25 @@ def check_coverage(
             'time_diff_seconds': time_diff_s,
             'n_bursts_with_baseline': None,
             'missing_product_expected': False,
+            'status': Status.PASS,
             'reason': '',
         }
         if not product_found:
-            if acq_by_burst_pol:
+            if not lookback_complete(query_windows, row.post_acq_dt, delta_lookback_days, delta_window_days):
+                record['status'] = Status.UNKNOWN
+                detail = 'lookback incomplete: a required RTC-S1 baseline window was not queried to completion'
+            else:
                 n_baseline = _baseline_burst_counts(
                     acq_by_burst_pol, list(row.burst_pols), row.post_acq_dt, delta_lookback_days, delta_window_days
                 )
                 record['n_bursts_with_baseline'] = n_baseline
                 record['missing_product_expected'] = n_baseline > 0
+                record['status'] = Status.FAIL if n_baseline > 0 else Status.SKIPPED
                 detail = (
                     f'{n_baseline}/{row.n_bursts} bursts have baseline imagery'
                     if n_baseline > 0
                     else 'no baseline imagery; product not expected'
                 )
-            else:
-                record['missing_product_expected'] = True
-                detail = 'baseline not checked (no lookback RTC metadata)'
             record['reason'] = f'no DIST-S1 product for RTC pass at {row.post_acq_dt} ({detail})'
         records.append(record)
     return pd.DataFrame(records, columns=COVERAGE_COLUMNS)

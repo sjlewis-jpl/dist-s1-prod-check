@@ -99,7 +99,6 @@ def _no_network(*args: object, **kwargs: object) -> NoReturn:
 
 # aa2014f: the post pass's own RTC rows make the burst map non-empty, so the pass reads
 # "no baseline imagery; product not expected" with missing_product_expected=False
-@pytest.mark.xfail(strict=True, reason='F02: lookback never downloaded is read as "no baseline", i.e. not expected')
 def test_f02_missing_lookback_is_unknown_not_unexpected() -> None:
     frame, groups = _passes((0, T0))
     df_dedup = _products(T0, tile='10SGD')  # no product in TILE
@@ -150,7 +149,6 @@ def test_f02_manifest_lookback_completeness(case: str, expected: bool) -> None:
 
 
 # aa2014f: ModuleNotFoundError: No module named 'dist_s1_prod_check.manifest' (Phase 1, Task 1.4)
-@pytest.mark.xfail(strict=True, reason='F02: a complete lookback query with 0 rows is a real "no baseline" finding')
 def test_f02_complete_empty_lookback_means_no_baseline() -> None:
     frame, groups = _passes((0, T0))  # no lookback RTC rows at all
     windows = _query_windows(n_rows=0)
