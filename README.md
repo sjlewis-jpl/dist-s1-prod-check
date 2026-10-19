@@ -4,6 +4,8 @@ Validation checks for the OPERA DIST-S1 production system, used as its productio
 metadata (GeoTIFF tags), NASA CMR granule metadata (or a producing cluster's bucket), and the expected enumeration
 from [dist-s1-enumerator](https://github.com/opera-adt/dist-s1-enumerator) at global scale.
 
+New here? Start with the step-by-step [quick start](docs/QUICKSTART.md).
+
 ## Checks
 
 `run-all` runs every check and writes one combined report; each also exists as a standalone command.
