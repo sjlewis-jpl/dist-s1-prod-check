@@ -4,7 +4,8 @@ Validation checks for the OPERA DIST-S1 production system, used as its productio
 metadata (GeoTIFF tags), NASA CMR granule metadata (or a producing cluster's bucket), and the expected enumeration
 from [dist-s1-enumerator](https://github.com/opera-adt/dist-s1-enumerator) at global scale.
 
-New here? Start with the step-by-step [quick start](docs/QUICKSTART.md).
+**New here?** Follow the [quick start](docs/QUICKSTART.md): install, test, a first small run and how to read the
+report, step by step.
 
 ## Checks
 
@@ -22,6 +23,9 @@ Contracts, units, every status and reason string, and the known limits are in [d
 
 ## Setup
 
+The [quick start](docs/QUICKSTART.md) walks through setup and a first run end to end; this section is the short
+version.
+
 ```bash
 curl -fsSL https://pixi.sh/install.sh | bash   # if pixi is missing
 pixi install
@@ -32,6 +36,9 @@ gated): put them in `~/.netrc` (`machine urs.earthdata.nasa.gov login ... passwo
 let `earthaccess.login()` prompt once.
 
 ## Gate workflow
+
+For a guided first run, including how to read the report and fix common errors, see the
+[quick start](docs/QUICKSTART.md).
 
 A gate run downloads fresh metadata, fetches tags, and runs every check over the whole window and AOI:
 
