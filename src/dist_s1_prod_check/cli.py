@@ -376,8 +376,29 @@ regression_option = click.option(
     help='Allow caches adopted with adopt-cache (provenance unverified). For regression runs only, never for a '
     'production-gate report; the report says so prominently.',
 )
-data_dir_option = click.option('--data-dir', type=click.Path(path_type=Path), default=Path('data'), show_default=True)
-out_dir_option = click.option('--out-dir', type=click.Path(path_type=Path), default=Path('outputs'), show_default=True)
+data_dir_option = click.option(
+    '--data-dir',
+    type=click.Path(path_type=Path),
+    default=Path('data'),
+    show_default=True,
+    help='Cache directory for the metadata tables, tags and checkpoints. Each directory belongs to one venue.',
+)
+out_dir_option = click.option(
+    '--out-dir',
+    type=click.Path(path_type=Path),
+    default=Path('outputs'),
+    show_default=True,
+    help='Output directory. Each run writes its own <stamp>_<hex>/ subdirectory and names it in <out-dir>/latest.',
+)
+
+# Times are parsed as UTC; a date alone means 00:00:00 that day. A timezone offset or trailing Z is not supported.
+_TIME_FORMAT = 'UTC, as YYYY-MM-DD (00:00:00 that day) or YYYY-MM-DDTHH:MM:SS; no timezone offset or Z'
+START_HELP = f'Start of the acquisition window, inclusive. {_TIME_FORMAT}. E.g. 2026-01-01.'
+STOP_HELP = f'End of the acquisition window, exclusive. {_TIME_FORMAT}. E.g. 2026-03-01 includes all of 2026-02-28.'
+BBOX_HELP = (
+    'AOI as lon_min lat_min lon_max lat_max (degrees); checks only the MGRS tiles it overlaps. '
+    'Boxes crossing the antimeridian are not supported.'
+)
 venue_option = click.option(
     '--venue',
     type=click.Choice(VENUES, case_sensitive=False),
@@ -489,16 +510,18 @@ def cli() -> None:
     """Validate the DIST-S1 production system."""
 
 
-@cli.command()
-@click.option('--start', required=True, help='Start of acquisition period, e.g. 2026-01-01.')
-@click.option('--stop', required=True, help='End of acquisition period, e.g. 2026-03-01.')
-@click.option('--bbox', type=float, nargs=4, default=None, help='AOI as lon_min lat_min lon_max lat_max.')
+@cli.command(short_help='Step 1a: download DIST-S1 and RTC-S1 metadata into the cache.')
+@click.option('--start', required=True, help=START_HELP)
+@click.option('--stop', required=True, help=STOP_HELP)
+@click.option('--bbox', type=float, nargs=4, default=None, help=BBOX_HELP)
 @click.option(
     '--lookback/--no-lookback', default=True, show_default=True, help='Also fetch RTC-S1 metadata for baseline windows.'
 )
 @click.option('--skip-rtc', is_flag=True, help='Only fetch DIST-S1 metadata.')
-@click.option('--chunk-days', type=int, default=2, show_default=True)
-@click.option('--workers', type=int, default=8, show_default=True)
+@click.option('--chunk-days', type=int, default=2, show_default=True, help='Days of acquisitions per CMR query.')
+@click.option(
+    '--workers', type=int, default=8, show_default=True, help='Concurrent metadata queries (CMR, or S3 listing days).'
+)
 @venue_option
 @offline_option
 @data_dir_option
@@ -514,7 +537,10 @@ def download_metadata(
     offline: bool,
     data_dir: Path,
 ) -> None:
-    """Download DIST-S1 and RTC-S1 granule metadata from CMR into geoparquet tables (check 1)."""
+    """Download DIST-S1 and RTC-S1 granule metadata into geoparquet tables (step 1a).
+
+    DIST-S1 metadata comes from CMR (PROD, UAT) or a listing of the OPS-POP1 bucket; RTC-S1 always from PROD CMR.
+    """
     from dist_s1_prod_check import cmr
 
     network.network_allowed('download-metadata')
@@ -579,9 +605,9 @@ def _adopt_tag_sources(data_dir: Path, url_template: str | None) -> None:
     )
 
 
-@cli.command()
-@click.option('--start', required=True, help='--start of the run that built the cache.')
-@click.option('--stop', required=True, help='--stop of the run that built the cache.')
+@cli.command(short_help='Utility: write manifests for a cache built before manifests existed.')
+@click.option('--start', required=True, help='--start of the run that built the cache (same format as run-all).')
+@click.option('--stop', required=True, help='--stop of the run that built the cache (same format as run-all).')
 @click.option('--bbox', type=float, nargs=4, default=None, help='--bbox of the run that built the cache, if any.')
 @click.option(
     '--lookback/--no-lookback',
@@ -663,10 +689,12 @@ tag_url_template_option = click.option(
 )
 
 
-@cli.command()
-@click.option('--workers', type=int, default=16, show_default=True)
+@cli.command(short_help='Step 1b: fetch product GeoTIFF tags (inputs, prior product); resumable.')
+@click.option('--workers', type=int, default=16, show_default=True, help='Threads reading product GeoTIFF tags.')
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
-@click.option('--seed', type=int, default=42, show_default=True)
+@click.option(
+    '--seed', type=int, default=42, show_default=True, help='Random seed for --sample; the same seed, the same sample.'
+)
 @tag_url_template_option
 @product_versions_option
 @offline_option
@@ -680,7 +708,7 @@ def fetch_tags(
     offline: bool,
     data_dir: Path,
 ) -> None:
-    """Fetch product GeoTIFF tags (inputs, prior product) from the DAAC; resumable."""
+    """Fetch product GeoTIFF tags (inputs, prior product) from the DAAC or --tag-url-template; resumable (step 1b)."""
     df_dist = checks.deduplicate_products(_filter_versions(_load_dist(data_dir), product_versions, None))
     if sample:
         df_dist = df_dist.sample(n=min(sample, len(df_dist)), random_state=seed)
@@ -1084,7 +1112,7 @@ def _coverage_section(
     return [section, orphans], csvs
 
 
-@cli.command()
+@cli.command(short_help='Check 2: one DIST-S1 version per tile and acquisition.')
 @offline_option
 @product_versions_option
 @regression_option
@@ -1105,7 +1133,7 @@ def check_duplicates(
     )
 
 
-@cli.command()
+@cli.command(short_help='Check 3: processing order matches acquisition order.')
 @offline_option
 @product_versions_option
 @regression_option
@@ -1128,7 +1156,7 @@ def check_ordering(
     )
 
 
-@cli.command()
+@cli.command(short_help='Check 4: each prior_dist_s1_product tag names the right prior.')
 @click.option(
     '--expect-none-at-start', is_flag=True, help='Require the first product per tile to have no prior (mission start).'
 )
@@ -1161,11 +1189,21 @@ def check_confirmation(
     )
 
 
-@cli.command()
-@click.option('--mode', type=click.Choice(['offline', 'online']), default='offline', show_default=True)
+@cli.command(short_help='Check 5: recorded RTC-S1 inputs match a re-enumeration.')
+@click.option(
+    '--mode',
+    type=click.Choice(['offline', 'online']),
+    default='offline',
+    show_default=True,
+    help='offline: re-enumerate from the cached RTC-S1 table. online: query ASF per product (slow; use --sample).',
+)
 @click.option('--sample', type=int, default=0, show_default=True, help='Randomly sample N products (0 = all).')
-@click.option('--seed', type=int, default=42, show_default=True)
-@click.option('--workers', type=int, default=8, show_default=True)
+@click.option(
+    '--seed', type=int, default=42, show_default=True, help='Random seed for --sample; the same seed, the same sample.'
+)
+@click.option(
+    '--workers', type=int, default=8, show_default=True, help='Worker processes (offline) or threads (online).'
+)
 @offline_option
 @product_versions_option
 @regression_option
@@ -1239,9 +1277,9 @@ def _check_coverage_standalone(
     )
 
 
-@cli.command()
-@click.option('--start', required=True)
-@click.option('--stop', required=True)
+@cli.command(short_help='Check 6: every eligible RTC-S1 pass has a product, and vice versa.')
+@click.option('--start', required=True, help=START_HELP)
+@click.option('--stop', required=True, help=STOP_HELP)
 @offline_option
 @product_versions_option
 @regression_option
@@ -1266,12 +1304,18 @@ def check_coverage(
     )
 
 
-@cli.command()
-@click.option('--start', required=True, help='Start of acquisition period, e.g. 2026-01-01.')
-@click.option('--stop', required=True, help='End of acquisition period, e.g. 2026-03-01.')
-@click.option('--bbox', type=float, nargs=4, default=None)
-@click.option('--workers', type=int, default=16, show_default=True)
-@click.option('--cmr-workers', type=int, default=8, show_default=True)
+@cli.command(short_help='Steps 1-6: download, fetch tags, run every check, write CSVs and the HTML report.')
+@click.option('--start', required=True, help=START_HELP)
+@click.option('--stop', required=True, help=STOP_HELP)
+@click.option('--bbox', type=float, nargs=4, default=None, help=BBOX_HELP)
+@click.option('--workers', type=int, default=16, show_default=True, help='Threads reading product GeoTIFF tags.')
+@click.option(
+    '--cmr-workers',
+    type=int,
+    default=8,
+    show_default=True,
+    help='Concurrent metadata queries (CMR chunks, or S3 listing days for OPS-POP1).',
+)
 @click.option(
     '--inputs-workers',
     type=int,
@@ -1280,7 +1324,12 @@ def check_coverage(
     help='Processes for the offline inputs check (the long stage).',
 )
 @click.option(
-    '--sample-inputs', type=int, default=0, show_default=True, help='Sample N products for the inputs check (0 = all).'
+    '--sample-inputs',
+    type=int,
+    default=0,
+    show_default=True,
+    help='Sample N products for the confirmation and inputs checks (0 = all); the other checks still cover '
+    'every product.',
 )
 @click.option(
     '--sample-tiles',
@@ -1289,15 +1338,35 @@ def check_coverage(
     show_default=True,
     help='Restrict every check to N random MGRS tiles (full time series per tile) for fast iteration (0 = all).',
 )
-@click.option('--seed', type=int, default=42, show_default=True)
-@click.option('--expect-none-at-start', is_flag=True)
-@click.option('--refresh', is_flag=True, help='Re-download metadata tables even if present.')
+@click.option(
+    '--seed',
+    type=int,
+    default=42,
+    show_default=True,
+    help='Random seed for --sample-inputs and --sample-tiles; the same seed, the same sample.',
+)
+@click.option(
+    '--expect-none-at-start',
+    is_flag=True,
+    help='The window starts the mission: require the first product of each tile to have no prior. Without it, '
+    'those products are SKIPPED in the confirmation check.',
+)
+@click.option(
+    '--refresh',
+    is_flag=True,
+    help='Re-download both metadata tables, and delete the inputs checkpoint and the RTC-S1 chunk checkpoints.',
+)
 @click.option(
     '--processing-start',
     default=None,
-    help='Only check DIST-S1 products processed at or after this time, e.g. 2026-09-24 (isolates one campaign).',
+    help=f'Only check DIST-S1 products processed at or after this time, e.g. 2026-09-24 to isolate one campaign. '
+    f'{_TIME_FORMAT}.',
 )
-@click.option('--processing-stop', default=None, help='Only check DIST-S1 products processed before this time.')
+@click.option(
+    '--processing-stop',
+    default=None,
+    help=f'Only check DIST-S1 products processed before this time (exclusive). {_TIME_FORMAT}.',
+)
 @tag_url_template_option
 @venue_option
 @offline_option
@@ -1327,7 +1396,7 @@ def run_all(
     data_dir: Path,
     out_dir: Path,
 ) -> None:
-    """Run checks 1-6 end to end: download metadata, fetch tags, run every check, write CSVs and an HTML report."""
+    """Run steps 1-6 end to end: download metadata, fetch tags, run every check, write CSVs and an HTML report."""
     from dist_s1_prod_check import cmr
 
     with _Run(out_dir, _stamp(), list(RUN_ALL_CHECKS), 'DIST-S1 Production Check', regression_baseline) as run:

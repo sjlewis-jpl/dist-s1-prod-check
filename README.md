@@ -9,15 +9,20 @@ report, step by step.
 
 ## Checks
 
-`run-all` runs every check and writes one combined report; each also exists as a standalone command.
+`run-all` runs steps 1-6 and writes one combined report. Each step also exists as a standalone command, and
+`dist-s1-prod-check --help` lists them by number.
 
-1. **Duplicates** (`check-duplicates`): one DIST-S1 version per tile and acquisition.
-2. **Processing order** (`check-ordering`): two views, first production over every version, and retained versions.
-3. **Confirmation chain** (`check-confirmation`): each product's `prior_dist_s1_product` is the latest version of
+- **Step 1a** (`download-metadata`): DIST-S1 metadata from CMR or the OPS-POP1 bucket, and RTC-S1 metadata from PROD
+  CMR, into the cache.
+- **Step 1b** (`fetch-tags`): each product's GeoTIFF tags (recorded inputs, prior product).
+
+2. **Duplicates** (`check-duplicates`): one DIST-S1 version per tile and acquisition.
+3. **Processing order** (`check-ordering`): two views, first production over every version, and retained versions.
+4. **Confirmation chain** (`check-confirmation`): each product's `prior_dist_s1_product` is the latest version of
    the previous acquisition that existed when the product was processed.
-4. **Product inputs** (`check-inputs`): recorded pre/post RTC-S1 inputs equal a re-enumeration
+5. **Product inputs** (`check-inputs`): recorded pre/post RTC-S1 inputs equal a re-enumeration
    (`--mode offline` from the cached RTC table; `--mode online` queries ASF per product).
-5. **Coverage and orphans** (`check-coverage`): every eligible RTC-S1 pass has a product, and every product a pass.
+6. **Coverage and orphans** (`check-coverage`): every eligible RTC-S1 pass has a product, and every product a pass.
 
 Contracts, units, every status and reason string, and the known limits are in [docs/CHECKS.md](docs/CHECKS.md).
 
@@ -110,6 +115,11 @@ dist-s1-prod-check run-all --venue UAT --start 2026-01-01 --stop 2026-03-01 \
 A venue can hold several processing campaigns of the same acquisitions (older ones are not deleted).
 `--processing-start` / `--processing-stop` restrict every check to products processed in that range;
 otherwise de-duplication keeps the latest product per tile/acquisition across campaigns.
+
+**Dates and times.** `--start`, `--stop`, `--processing-start` and `--processing-stop` take a UTC date
+(`2026-01-01`, meaning 00:00:00 that day) or a UTC date and time (`2026-01-01T06:30:00`). A timezone offset or a
+trailing `Z` is not supported. Every window is half-open: the start is included and the stop is excluded, so
+`--stop 2026-03-01` ends at the last instant of 2026-02-28.
 
 Only DIST-S1 metadata and GeoTIFF tags come from UAT; RTC-S1 inputs are still read from PROD CMR.
 Requires a `machine uat.urs.earthdata.nasa.gov` entry in `~/.netrc`. Each data dir is tied to one venue

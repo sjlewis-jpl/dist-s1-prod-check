@@ -40,7 +40,10 @@ an older, readable version.
 - Network paths (CMR paging and response validation, chunk manifests, the OPS-POP1 S3 listing, live tag reads and
   retries, online inputs mode) are validated with mocked responses only, not against a live venue.
 
-## 1. Duplicates (`duplicates`)
+Checks are numbered as in `dist-s1-prod-check --help`: step 1 (`download-metadata`, `fetch-tags`) gathers the
+data, and checks 2-6 follow. Times are UTC dates or date-times, with no offset (README, "Dates and times").
+
+## 2. Duplicates (`duplicates`)
 
 - **Asserts:** each tile and acquisition time has exactly one DIST-S1 version.
 - **Universe and unit:** every acquisition in the universe (all versions, before deduplication); unit **duplicate
@@ -52,7 +55,7 @@ an older, readable version.
   same pass whose recorded acquisition time differs by a few seconds are not grouped (127 such products exist in UAT
   outside the September campaign; decision D11). They surface as orphans in coverage.
 
-## 2. Processing order (`ordering_first_production`, `ordering`)
+## 3. Processing order (`ordering_first_production`, `ordering`)
 
 Two views (decision 2):
 
@@ -68,7 +71,7 @@ Two views (decision 2):
   (no predecessor, or reprocessed in the retained view). Equal processing times are in order and counted as `tie`
   (F36).
 
-## 3. Confirmation chain (`confirmation`)
+## 4. Confirmation chain (`confirmation`)
 
 - **Asserts:** a product's `prior_dist_s1_product` tag names the latest version of the previous acquisition in its
   tile that existed when the product was processed (decision 3), compared by **full** id against every version.
@@ -90,7 +93,7 @@ Two views (decision 2):
 - **Limits:** the previous acquisition is the previous one in time even if it had not been produced yet when the
   product was made (D9); such a product fails here and the inversion shows in the first-production view.
 
-## 4. Product inputs (`inputs`, `inputs_post`, `inputs_pre`, `inputs_other`)
+## 5. Product inputs (`inputs`, `inputs_post`, `inputs_pre`, `inputs_other`)
 
 - **Asserts:** the pre and post RTC-S1 ids recorded in a product's tags equal those a re-enumeration with
   dist-s1-enumerator (multi-window lookback 365/730/1095 days, 60-day windows, max 4/3/3 pre-images per burst)
@@ -120,7 +123,7 @@ Two views (decision 2):
   granule ingested after the product was made can appear as "expected but not found" (7 of 133 pop1 post failures
   at review time). Do not "fix" this by filtering on processing time, which is not ingestion time.
 
-## 5. Coverage (`coverage`) and orphans (`orphans`)
+## 6. Coverage (`coverage`) and orphans (`orphans`)
 
 - **Asserts:** every eligible RTC-S1 pass in the acquisition window and AOI has a DIST-S1 product (decision 1): the
   check expects every pass with baseline imagery, so in a campaign run (`--processing-start`) passes the campaign did

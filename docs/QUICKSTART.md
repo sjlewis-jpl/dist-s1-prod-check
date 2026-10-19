@@ -57,6 +57,9 @@ dist-s1-prod-check run-all --start 2026-01-01 --stop 2026-03-01 \
 This logs in to Earthdata to query the DIST-S1 collection in CMR. Without a `~/.netrc` entry it stops with an
 Earthdata login error.
 
+`--start` and `--stop` are UTC dates (or `YYYY-MM-DDTHH:MM:SS`, no offset); the stop is excluded, so this window
+is all of January and February.
+
 Either way, the run downloads metadata for the 12 MGRS tiles under the box, reads the product tags, runs every
 check and writes one run directory. Each venue needs its own `--data-dir`, because a data dir is tied to the venue
 that built it. Re-running the same command reuses the cache. Add `--refresh` to download again.
