@@ -173,6 +173,13 @@ counts every failure, with rows that have no tile counted in the legend) and loa
 CDNs; without them the map says so and everything else still renders. `dist_s1_prod_check.reconcile.reconcile_run`
 checks that a run's report and CSVs agree.
 
+## Deletion lists
+
+`dist-s1-prod-check deletion-lists` reads a finished run and writes `<run dir>/deletion_lists/`. That folder holds
+the granules to delete and regenerate, grouped by reason: each failed granule, plus every later product of its
+MGRS tile, since the prior chain carries the error forward. It is a report only; it deletes nothing. See
+[docs/DELETION_LISTS.md](docs/DELETION_LISTS.md).
+
 ## Memory at global scale
 
 CMR pages are parsed and discarded as they stream in (never accumulated as raw JSON), the

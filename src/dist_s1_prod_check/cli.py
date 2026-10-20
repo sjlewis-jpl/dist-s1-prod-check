@@ -8,7 +8,19 @@ import click
 import geopandas as gpd
 import pandas as pd
 
-from dist_s1_prod_check import checks, coverage, inputs, manifest, matching, network, report, schema, status, tags
+from dist_s1_prod_check import (
+    checks,
+    coverage,
+    deletion,
+    inputs,
+    manifest,
+    matching,
+    network,
+    report,
+    schema,
+    status,
+    tags,
+)
 from dist_s1_prod_check.constants import (
     DIST_S1_PARQUET,
     DIST_S1_S3_BUCKETS,
@@ -1541,3 +1553,60 @@ def run_all(
             run.add(key, *builds[key]())
         _record_file(run, data_dir / INPUTS_CHECKPOINT_PARQUET)
         run.complete()
+
+
+@cli.command(short_help='Report: DIST-S1 granules to delete and regenerate, per reason, from a finished run.')
+@click.option(
+    '--run-dir',
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help='Run directory to read (<out-dir>/<stamp>_<hex>). Default: the newest run under --out-dir.',
+)
+@click.option(
+    '--unknown-as-failure',
+    is_flag=True,
+    help='Treat UNKNOWN results (could not be checked) as failures: candidate roots that also list every later '
+    'product of their tile. Without it they are listed as unverified, with nothing downstream.',
+)
+@click.option(
+    '--compare-run-dir',
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help='Another complete run to compare with (same rules and options): marks each granule same, changed or '
+    'listed in one run only, and writes comparison_*.csv.',
+)
+@out_dir_option
+def deletion_lists(run_dir: Path | None, unknown_as_failure: bool, compare_run_dir: Path | None, out_dir: Path) -> None:
+    """Write deletion-candidate lists for one complete run into its deletion_lists/ subdirectory (reports only).
+
+    A granule that failed a check is a root; every later product of its MGRS tile is listed as downstream of the
+    tile's earliest root, since the prior chain carries the error forward. Pre-image input mismatches are listed
+    as under_review, apart from the candidates. Nothing is deleted.
+    """
+    run_dir = run_dir or latest_run_directory(out_dir)
+    tables, run_manifest = deletion.load_run(run_dir)
+    lists = deletion.build_deletion_lists(tables, unknown_as_failure=unknown_as_failure)
+    comparison = None
+    if compare_run_dir is not None:
+        other_tables, _ = deletion.load_run(compare_run_dir)
+        other = deletion.build_deletion_lists(other_tables, unknown_as_failure=unknown_as_failure)
+        comparison = deletion.compare_lists(lists, other)
+    target = deletion.write_deletion_lists(
+        run_dir, lists, run_manifest, unknown_as_failure, comparison=comparison, compare_run_dir=compare_run_dir
+    )
+    for row in lists.summary.itertuples():
+        click.echo(
+            f'{row.tier:<12} {row.root_class:<28} roots {row.n_root_granules:>7}  passes {row.n_root_passes:>5}  '
+            f'downstream {row.n_downstream_caused:>7}  tiles {row.n_tiles:>6}'
+        )
+    if comparison is not None:
+        counts = comparison.granules.in_other_run.value_counts()
+        n_same = int((comparison.status == deletion.SAME).sum())
+        click.echo(
+            f'Compared with {compare_run_dir}: {n_same} granules listed the same, '
+            + ', '.join(
+                f'{int(counts.get(k, 0))} {k}' for k in (deletion.CHANGED, deletion.ONLY_THIS, deletion.ONLY_OTHER)
+            )
+            + f'; {len(comparison.roots)} roots in one run only'
+        )
+    click.echo(f'Wrote {target}')
