@@ -246,3 +246,179 @@ def test_f16_chunk_reuse_needs_matching_manifest(
     assert len(queries) == n_queries, f'{case}: CMR queried {len(queries)} times'
     assert log2[0]['reused'] is (n_queries == 1)
     assert df.opera_id.tolist() == ids
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# F39: CMR under-reported hits during the 2026-10-20 outage. Two RTC-S1 chunks answered 970 and 797 hits (true
+# 45,017 and 34,557), returned 1,039 and 800 granules, and were cached as complete; every resume reused them.
+
+
+def _pages_with_hits(n_items: int, hits: list[int]) -> list[FakeResponse]:
+    items = [{'meta': {'concept-id': f'G{i}-ASF'}} for i in range(n_items)]
+    pages = []
+    for k, h in enumerate(hits):
+        chunk = items[k * CMR_PAGE_SIZE : (k + 1) * CMR_PAGE_SIZE]
+        headers = {'CMR-Hits': str(h)} | ({'CMR-Search-After': f'k{k}'} if k < len(hits) - 1 else {})
+        pages.append(FakeResponse({'items': chunk}, headers=headers))
+    return pages
+
+
+# b23b0b6: returned 2,005 rows; the first page's 2,005 hits were kept and the second page's 9,000 ignored.
+def test_f39_hits_changing_between_pages_raises_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve(monkeypatch, _pages_with_hits(CMR_PAGE_SIZE + 5, [2005, 9000]))
+
+    items, error = _search_outcome()
+
+    _assert_incomplete_raised(items, error)
+    assert 'changed while paging' in str(error)
+
+
+# b23b0b6: returned 1,039 rows for an old window that reported 970 hits (accepted as "ingested while paging").
+def test_f39_more_rows_than_hits_for_an_old_window_raises_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve(monkeypatch, _pages_with_hits(1039, [970]))
+
+    items, error = _search_outcome()
+
+    _assert_incomplete_raised(items, error)
+    assert 'unreliable' in str(error)
+
+
+def test_f39_more_rows_than_hits_for_a_recent_window_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve(monkeypatch, _pages_with_hits(12, [10]))
+    start = pd.Timestamp.now().normalize() - pd.Timedelta(days=3)
+
+    result = cmr.search_granules(RTC_S1_CONCEPT_ID, start, start + pd.Timedelta(days=2))
+
+    assert len(result) == 12 and result.hits == 10
+
+
+OLD_START = pd.Timestamp('2025-01-01')
+N_PER_CHUNK = 150
+
+
+def _chunk_ids(t0: pd.Timestamp, n: int) -> list[str]:
+    return [rtc_id(BURST, t0 + pd.Timedelta(minutes=i), t0 + pd.Timedelta(hours=5)) for i in range(n)]
+
+
+def _scripted_search(queries: list[pd.Timestamp], short: dict[pd.Timestamp, list[int]]) -> Callable[..., list[dict]]:
+    """Return a CMR stand-in serving `N_PER_CHUNK` granules per chunk, with hits equal to what it returns.
+
+    The k-th query of a chunk in `short` returns `short[t0][k]` granules instead (the last entry repeats).
+    """
+
+    def fake_search(
+        concept_id: str, t0: pd.Timestamp, t1: pd.Timestamp, parse_fn: Callable[[dict], dict], **kwargs: object
+    ) -> list[dict]:
+        k = sum(q == t0 for q in queries)
+        queries.append(t0)
+        script = short.get(t0)
+        n = script[min(k, len(script) - 1)] if script else N_PER_CHUNK
+        result = cmr.GranuleList(parse_fn(_umm_item(i)) for i in _chunk_ids(t0, n))
+        result.hits = n
+        return result
+
+    return fake_search
+
+
+def _rtc_table(tmp_path: Path, log: list[dict] | None = None) -> pd.DataFrame:
+    stop = OLD_START + pd.Timedelta(days=10)  # five 2-day chunks
+    return cmr.get_rtc_s1_table(
+        OLD_START, stop, chunk_days=2, max_workers=1, cache_dir=tmp_path / 'chunks', chunk_log=log
+    )
+
+
+def _manifest_of(tmp_path: Path, t0: pd.Timestamp) -> dict:
+    import json
+
+    (path,) = (tmp_path / 'chunks').glob(f'*_{t0:%Y%m%dT%H%M%S}_*.manifest.json')
+    return json.loads(path.read_text())
+
+
+# b23b0b6: the 4-granule answer was accepted and cached; the table had 4 granules for the chunk instead of 150.
+def test_f39_under_reported_chunk_is_requeried_and_replaced(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bad = OLD_START + pd.Timedelta(days=4)
+    queries: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(queries, {bad: [4, N_PER_CHUNK]}))
+
+    log: list[dict] = []
+    df = _rtc_table(tmp_path, log)
+
+    assert len(df) == 5 * N_PER_CHUNK
+    assert queries.count(bad) == 3  # the short answer, then two agreeing full answers
+    record = _manifest_of(tmp_path, bad)
+    assert (record['rows'], record['plausibility_confirmed'], record['implausible_rows']) == (N_PER_CHUNK, True, 4)
+    assert record['confirm_queries'] == 2
+    assert [r['rows'] for r in log] == [N_PER_CHUNK] * 5
+
+
+# b23b0b6: the short chunk cached by an earlier (outage) run was reused on every rerun; CMR was never asked again.
+def test_f39_short_chunk_cached_by_an_earlier_run_is_caught_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bad = OLD_START + pd.Timedelta(days=2)
+    outage: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(outage, {bad: [4]}))
+    monkeypatch.setattr(cmr, 'CHUNK_CONFIRM_ATTEMPTS', 0)  # the outage run could not confirm and stopped
+    with pytest.raises(cmr.IncompleteResultsError):
+        _rtc_table(tmp_path)
+    assert _manifest_of(tmp_path, bad)['rows'] == 4, 'the outage answer was not cached; the test sets up nothing'
+
+    monkeypatch.setattr(cmr, 'CHUNK_CONFIRM_ATTEMPTS', 4)
+    resume: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(resume, {}))
+    df = _rtc_table(tmp_path)
+
+    assert resume == [bad, bad], 'only the short chunk should be re-queried, until two answers agree'
+    assert len(df) == 5 * N_PER_CHUNK
+
+
+def test_f39_real_gap_is_confirmed_kept_and_not_requeried_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gap = OLD_START + pd.Timedelta(days=6)
+    queries: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(queries, {gap: [3]}))
+
+    df = _rtc_table(tmp_path)
+
+    assert len(df) == 4 * N_PER_CHUNK + 3
+    assert queries.count(gap) == 2
+    assert _manifest_of(tmp_path, gap)['plausibility_confirmed'] is True
+
+    rerun: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(rerun, {gap: [3]}))
+    assert len(_rtc_table(tmp_path)) == 4 * N_PER_CHUNK + 3
+    assert rerun == [], 'a confirmed gap was re-queried on a rerun'
+
+
+def test_f39_chunk_never_agreeing_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bad = OLD_START + pd.Timedelta(days=4)
+    queries: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(queries, {bad: [4, 5, 6, 7, 8, 9]}))
+
+    with pytest.raises(cmr.IncompleteResultsError, match='never returned the same granules twice'):
+        _rtc_table(tmp_path)
+    assert queries.count(bad) == 1 + cmr.CHUNK_CONFIRM_ATTEMPTS
+
+
+def test_f39_small_queries_are_not_judged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sparse = {OLD_START + pd.Timedelta(days=2 * k): [n] for k, n in enumerate([20, 0, 20, 0, 20])}
+    queries: list[pd.Timestamp] = []
+    monkeypatch.setattr(cmr, 'search_granules', _scripted_search(queries, sparse))
+
+    assert len(_rtc_table(tmp_path)) == 60
+    assert len(queries) == 5, 'an AOI-sized query was re-queried'
+
+
+def test_f39_incomplete_chunk_answer_is_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cmr._search_chunk.retry, 'wait', wait_none())
+    answers = iter([cmr.IncompleteResultsError('flaky'), ['ok']])
+
+    def flaky(*args: object, **kwargs: object) -> list[str]:
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(cmr, 'search_granules', flaky)
+    assert cmr._search_chunk(RTC_S1_CONCEPT_ID, OLD_START, OLD_START) == ['ok']

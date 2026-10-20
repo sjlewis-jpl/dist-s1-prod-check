@@ -32,7 +32,11 @@ an older, readable version.
 - Layer completeness (GEN-METRIC, GEN-DIST-STATUS-ACQ) is not checked (decision 5); only the STATUS layer's tags
   are read.
 - A CMR query that returned as many rows as `CMR-Hits` was paged to the end; that does not prove the archive itself
-  is complete.
+  is complete. CMR can under-report hits and return that many granules (two RTC-S1 chunks during the 2026-10-20
+  outage, ~1/45 of the truth). So a chunk is also rejected and retried if its hits change between pages, or if it
+  returns more rows than hits for a window older than 30 days. A chunk far below its neighbours (< 25% of the
+  median granules per day) is re-queried until two answers agree, and cached chunks are judged the same way on
+  resume (F39). An under-report spread evenly over every chunk would still pass.
 - Sampling is not for the gate: `--sample-tiles` draws only from tiles that have DIST-S1 products, so a tile with
   no products at all can never be sampled and its missing passes are never seen (F29).
 - AOI runs (`--bbox`) query DIST-S1 CMR with the raw bbox, not the MGRS tile geometry (F32, speculative); the

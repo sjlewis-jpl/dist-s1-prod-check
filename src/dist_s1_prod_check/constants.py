@@ -42,6 +42,14 @@ RTC_CHUNKS_DIR = 'rtc_s1_chunks'  # per-chunk CMR checkpoints, removed once RTC_
 # re-queried. Bump CHUNK_SCHEMA_VERSION whenever a granule parser's output columns change.
 MUTABLE_RECENT_DAYS = 30
 CHUNK_SCHEMA_VERSION = 1
+# A CMR chunk whose granules per day fall below CHUNK_OUTLIER_FRACTION of the median of the chunks of its query is
+# re-queried until two consecutive answers return the same granules, at most CHUNK_CONFIRM_ATTEMPTS times. Queries
+# whose median chunk holds fewer than CHUNK_OUTLIER_MIN_MEDIAN_ROWS granules (small AOIs) are not judged. During the
+# 2026-10-20 CMR outage two RTC-S1 chunks reported ~1/45 of their true hits and returned about that many granules,
+# so they passed as complete.
+CHUNK_OUTLIER_FRACTION = 0.25
+CHUNK_OUTLIER_MIN_MEDIAN_ROWS = 100
+CHUNK_CONFIRM_ATTEMPTS = 4
 TAGS_PARQUET = 'dist_s1_tags.parquet'
 INPUTS_CHECKPOINT_PARQUET = 'inputs_check_results.parquet'
 TARGET_TILES_FILE = 'target_mgrs_tiles.txt'

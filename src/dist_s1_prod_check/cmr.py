@@ -19,11 +19,20 @@ from dist_s1_enumerator.mgrs_burst_data import (
     get_mgrs_tiles_overlapping_geometry,
 )
 from shapely.geometry import box
-from tenacity import retry, retry_if_not_exception_type, stop_after_attempt, wait_random_exponential
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 from tqdm import tqdm
 
 from dist_s1_prod_check import manifest
 from dist_s1_prod_check.constants import (
+    CHUNK_CONFIRM_ATTEMPTS,
+    CHUNK_OUTLIER_FRACTION,
+    CHUNK_OUTLIER_MIN_MEDIAN_ROWS,
     CHUNK_SCHEMA_VERSION,
     CMR_GRANULES_URL,
     CMR_GRANULES_URLS,
@@ -108,8 +117,11 @@ def search_granules(
     """Search CMR granules; with `parse_fn`, each page is parsed as it arrives so raw UMM JSON is never accumulated.
 
     Returns a `GranuleList` whose `hits` is the count CMR reported. Raises `IncompleteResultsError` if CMR reported
-    no count, or if fewer granules arrived than it reported (F15). More is accepted: granules ingested while paging.
-    A hits match proves the query was paged to the end, not that the archive itself is complete.
+    no count, if fewer granules arrived than it reported (F15), or if the reported count is evidently wrong: it
+    changed between pages, or more granules arrived than it reported for a window that ended more than
+    `MUTABLE_RECENT_DAYS` ago (only recent acquisitions are still being ingested while we page). A hits match proves
+    the query was paged to the end, not that the archive itself is complete: CMR can under-report hits and match
+    them (see `_implausible_chunks`).
     """
     network_allowed('a CMR granule search (metadata download or chunk re-query)')
     params: dict = {
@@ -126,19 +138,46 @@ def search_granules(
     headers = {'Authorization': f'Bearer {token}'} if token else {}
     items = GranuleList()
     search_after = None
+    page_hits_seen: set[int] = set()
     while True:
         page_headers = headers | ({'CMR-Search-After': search_after} if search_after else {})
         page_items, search_after, page_hits = _get_page(params, page_headers, cmr_url)
         items.hits = page_hits if items.hits is None else items.hits
+        if page_hits is not None:
+            page_hits_seen.add(page_hits)
         items.extend(map(parse_fn, page_items) if parse_fn else page_items)
         if not page_items or search_after is None:
             break
     window = f'{params["temporal"]} of {collection_concept_id}'
     if items.hits is None:
         raise IncompleteResultsError(f'CMR reported no hit count for {window}; completeness is unknown')
+    if len(page_hits_seen) > 1:
+        raise IncompleteResultsError(f'CMR-Hits changed while paging {window}: {sorted(page_hits_seen)}')
     if len(items) < items.hits:
         raise IncompleteResultsError(f'CMR returned {len(items)} of {items.hits} granules for {window}')
+    if len(items) > items.hits and not _is_recent(stop_time):
+        raise IncompleteResultsError(
+            f'CMR returned {len(items)} granules for {window} but reported {items.hits}; acquisitions older than '
+            f'{MUTABLE_RECENT_DAYS} days are no longer ingested, so the reported count is unreliable'
+        )
     return items
+
+
+def _is_recent(stop_time: DateLike) -> bool:
+    """Whether a window ending at `stop_time` ends less than `MUTABLE_RECENT_DAYS` ago (still being ingested)."""
+    now = _utc_naive(pd.Timestamp.now(tz='UTC'))
+    return _utc_naive(stop_time) + pd.Timedelta(days=MUTABLE_RECENT_DAYS) > now
+
+
+@retry(
+    retry=retry_if_exception_type(IncompleteResultsError),
+    stop=stop_after_attempt(3),
+    wait=wait_random_exponential(multiplier=2, max=60),
+    reraise=True,
+)
+def _search_chunk(*args: object, **kwargs: object) -> list[dict]:
+    """`search_granules` for one chunk, retried when CMR's answer is incomplete or inconsistent."""
+    return search_granules(*args, **kwargs)
 
 
 def _date_chunks(start_time: DateLike, stop_time: DateLike, chunk_days: int) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
@@ -205,8 +244,8 @@ def _search_chunked_to_df(
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-    def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> tuple[pd.DataFrame, dict]:
-        query = {
+    def _query(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> dict:
+        return {
             'concept_id': collection_concept_id,
             'start': manifest._iso(chunk[0]),
             'stop': manifest._iso(chunk[1]),
@@ -214,23 +253,25 @@ def _search_chunked_to_df(
             'cmr_url': cmr_url,
             'schema_version': CHUNK_SCHEMA_VERSION,
         }
-        path = None
-        if cache_dir is not None:
-            path = cache_dir / f'{collection_concept_id}_{chunk[0]:%Y%m%dT%H%M%S}_{chunk[1]:%Y%m%dT%H%M%S}.parquet'
-            cached = _reusable_chunk(path, query)
-            if cached is not None:
-                return cached
-        records = search_granules(
+
+    def _path(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> Path | None:
+        if cache_dir is None:
+            return None
+        return cache_dir / f'{collection_concept_id}_{chunk[0]:%Y%m%dT%H%M%S}_{chunk[1]:%Y%m%dT%H%M%S}.parquet'
+
+    def _fresh(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> tuple[pd.DataFrame, dict]:
+        records = _search_chunk(
             collection_concept_id, chunk[0], chunk[1], token=token, bbox=bbox, parse_fn=parse_fn, cmr_url=cmr_url
         )
         df_chunk = pd.DataFrame(records)
         record = {
-            **query,
+            **_query(chunk),
             'query_time_utc': manifest.now_utc(),
             'hits': getattr(records, 'hits', None),
             'rows': len(df_chunk),
             'complete': True,
         }
+        path = _path(chunk)
         if path is not None:
             tmp = path.with_suffix('.tmp')
             df_chunk.to_parquet(tmp, compression='zstd')
@@ -239,21 +280,97 @@ def _search_chunked_to_df(
             _write_json(_chunk_manifest_path(path), record)
         return df_chunk, {**record, 'reused': False}
 
+    def _one(chunk: tuple[pd.Timestamp, pd.Timestamp]) -> tuple[pd.DataFrame, dict]:
+        path = _path(chunk)
+        if path is not None:
+            cached = _reusable_chunk(path, _query(chunk))
+            if cached is not None:
+                return cached
+        return _fresh(chunk)
+
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         with tqdm(total=len(chunks), desc=desc, unit='chunk') as pbar:
-            frames = []
+            results = []
             n_granules = 0
             for df_chunk, record in pool.map(_one, chunks):
-                if chunk_log is not None:
-                    chunk_log.append(record)
-                if not df_chunk.empty:
-                    frames.append(df_chunk)
-                    n_granules += len(df_chunk)
+                results.append((df_chunk, record))
+                n_granules += len(df_chunk)
                 pbar.update(1)
                 pbar.set_postfix(granules=n_granules)
+    for i in _implausible_chunks(chunks, results, chunk_days):
+        results[i] = _confirm_chunk(chunks[i], results[i], _fresh, _path(chunks[i]), collection_concept_id)
+    if chunk_log is not None:
+        chunk_log.extend(record for _, record in results)
+    frames = [df_chunk for df_chunk, _ in results if not df_chunk.empty]
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
+
+
+def _implausible_chunks(
+    chunks: list[tuple[pd.Timestamp, pd.Timestamp]], results: list[tuple[pd.DataFrame, dict]], chunk_days: int
+) -> list[int]:
+    """Indexes of chunks whose granules per day are below `CHUNK_OUTLIER_FRACTION` of the median of `chunks`.
+
+    CMR can under-report hits and return exactly that many granules, so a single answer cannot be trusted on its
+    own; its neighbours can. Not judged with fewer than 3 chunks or a median chunk under
+    `CHUNK_OUTLIER_MIN_MEDIAN_ROWS` granules. A chunk already confirmed by agreeing re-queries
+    (``plausibility_confirmed`` in its manifest) is not flagged again.
+    """
+    if len(chunks) < 3:
+        return []
+    days = [(c[1] - c[0]) / pd.Timedelta(days=1) for c in chunks]
+    rates = pd.Series([len(df) / d for (df, _), d in zip(results, days)])
+    median = float(rates.median())
+    if median * chunk_days < CHUNK_OUTLIER_MIN_MEDIAN_ROWS:
+        return []
+    return [
+        i
+        for i, (rate, (_, record)) in enumerate(zip(rates, results))
+        if rate < CHUNK_OUTLIER_FRACTION * median and not record.get('plausibility_confirmed')
+    ]
+
+
+def _same_granules(a: pd.DataFrame, b: pd.DataFrame) -> bool:
+    if 'opera_id' in a.columns and 'opera_id' in b.columns:
+        return set(a.opera_id) == set(b.opera_id)
+    return len(a) == len(b)
+
+
+def _confirm_chunk(
+    chunk: tuple[pd.Timestamp, pd.Timestamp],
+    first: tuple[pd.DataFrame, dict],
+    fresh: Callable[[tuple[pd.Timestamp, pd.Timestamp]], tuple[pd.DataFrame, dict]],
+    path: Path | None,
+    collection_concept_id: str,
+) -> tuple[pd.DataFrame, dict]:
+    """Re-query an implausibly small chunk until two consecutive answers return the same granules.
+
+    The agreed answer replaces the first one (and its checkpoint), with ``plausibility_confirmed``, the number of
+    ``confirm_queries`` and the ``implausible_rows`` that triggered it in its manifest. A real gap (e.g. a satellite
+    outage) is confirmed and kept; an under-reported answer is replaced. Raises `IncompleteResultsError` if no two
+    consecutive answers agree within `CHUNK_CONFIRM_ATTEMPTS` re-queries.
+    """
+    previous = first[0]
+    implausible_rows = len(previous)
+    for attempt in range(1, CHUNK_CONFIRM_ATTEMPTS + 1):
+        df_chunk, record = fresh(chunk)
+        if _same_granules(df_chunk, previous):
+            record = {
+                **record,
+                'plausibility_confirmed': True,
+                'confirm_queries': attempt,
+                'implausible_rows': implausible_rows,
+            }
+            if path is not None:
+                _write_json(_chunk_manifest_path(path), {k: v for k, v in record.items() if k != 'reused'})
+            return df_chunk, record
+        previous = df_chunk
+    raise IncompleteResultsError(
+        f'CMR chunk {manifest._iso(chunk[0])},{manifest._iso(chunk[1])} of {collection_concept_id} returned '
+        f'{implausible_rows} granules, far below its neighbours, and {CHUNK_CONFIRM_ATTEMPTS} re-queries never '
+        'returned the same granules twice'
+    )
 
 
 def _chunk_manifest_path(path: Path) -> Path:
