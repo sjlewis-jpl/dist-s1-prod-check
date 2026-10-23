@@ -1596,7 +1596,8 @@ def deletion_lists(run_dir: Path | None, unknown_as_failure: bool, compare_run_d
     )
     for row in lists.summary.itertuples():
         click.echo(
-            f'{row.tier:<12} {row.root_class:<28} roots {row.n_root_granules:>7}  passes {row.n_root_passes:>5}  '
+            f'{row.tier:<12} {row.root_class:<28} failing {row.n_failing:>7}  roots {row.n_root_granules:>7}  '
+            f'passes {row.n_root_passes:>5}  '
             f'downstream {row.n_downstream_caused:>7}  tiles {row.n_tiles:>6}'
         )
     if comparison is not None:

@@ -48,7 +48,8 @@ STALE_CHAIN = 'stale_chain'
 PROCESSING_ORDER = 'processing_order'
 FIRST_PRODUCTION_ORDER = 'first_production_order'
 INPUTS_POST = 'inputs_post'
-INPUTS_PRE = 'inputs_pre'
+INPUTS_PRE_MISSING = 'inputs_pre_missing'
+INPUTS_PRE_EXTRA = 'inputs_pre_extra'
 INPUTS_BURST_MISMATCH = 'inputs_burst_mismatch'
 INPUTS_NO_EXPECTED_PRODUCT = 'inputs_no_expected_product'
 INPUTS_OTHER = 'inputs_other'
@@ -72,14 +73,15 @@ CLASSES = [
     INPUTS_OTHER,
     COVERAGE_GAP,
     COVERAGE_ORPHAN,
-    INPUTS_PRE,
+    INPUTS_PRE_MISSING,
+    INPUTS_PRE_EXTRA,
     *UNKNOWN_CLASSES,
 ]
 INPUT_ISSUE_CLASSES = {
     'Post RTC IDs expected but not found': INPUTS_POST,
     'Post RTC IDs found but not expected': INPUTS_POST,
-    'Pre RTC IDs expected but not found': INPUTS_PRE,
-    'Pre RTC IDs found but not expected': INPUTS_PRE,
+    'Pre RTC IDs expected but not found': INPUTS_PRE_MISSING,
+    'Pre RTC IDs found but not expected': INPUTS_PRE_EXTRA,
     'Burst ID mismatch': INPUTS_BURST_MISMATCH,
     'No expected product found': INPUTS_NO_EXPECTED_PRODUCT,
 }
@@ -199,7 +201,9 @@ def collect_roots(tables: RunTables, unknown_as_failure: bool = False) -> pd.Dat
     for root_class, group in inp.groupby('root_class', sort=False):
         detail = group.groupby('opera_id', sort=False).issue_type.agg(lambda v: '; '.join(sorted(set(v.fillna('')))))
         rows = group.drop_duplicates('opera_id').set_index('opera_id').loc[detail.index].reset_index()
-        level = {UNKNOWN_INPUTS: unknown_level, INPUTS_PRE: UNDER_REVIEW}.get(root_class, CANDIDATE)
+        level = {UNKNOWN_INPUTS: unknown_level, INPUTS_PRE_MISSING: UNDER_REVIEW, INPUTS_PRE_EXTRA: UNDER_REVIEW}.get(
+            root_class, CANDIDATE
+        )
         cascades = unknown_as_failure if root_class == UNKNOWN_INPUTS else True
         parts.append(_roots(rows, root_class, level, cascades, detail.reset_index(drop=True)))
 
@@ -335,21 +339,30 @@ def _tiles_table(granules: pd.DataFrame, roots: pd.DataFrame, products: pd.DataF
 
 
 def _summary(granules: pd.DataFrame, roots: pd.DataFrame) -> pd.DataFrame:
-    """Count roots, passes and the downstream they cause, per tier and root class, plus per-tier totals."""
+    """Count, per tier and root class, the granules failing the class and what the tier lists because of it.
+
+    `n_failing`: granules that failed the class (at this tier's level), wherever they are listed.
+    `n_root_granules`: those of them listed as roots in this tier, i.e. not already listed in a higher tier.
+    `n_downstream_caused`: downstream granules of this tier whose tile's earliest root has this class.
+    Class rows overlap when a granule fails several classes; the TOTAL row counts each granule once.
+    """
     rows = []
     for tier in TIERS:
         g = granules[granules.tier == tier]
         tier_roots = roots[roots.level == tier]
+        listed_roots = set(g[g.role == ROOT].opera_id)
         for root_class in CLASSES:
             r = tier_roots[tier_roots.root_class == root_class]
             if r.empty:
                 continue
+            failing = set(r[r.opera_id != ''].opera_id)
             down = g[(g.role == DOWNSTREAM) & (g.cause_class == root_class)]
             rows.append(
                 {
                     'tier': tier,
                     'root_class': root_class,
-                    'n_root_granules': int(r[r.opera_id != ''].opera_id.nunique()),
+                    'n_failing': len(failing),
+                    'n_root_granules': len(failing & listed_roots),
                     'n_root_passes': int((r.opera_id == '').sum()),
                     'n_downstream_caused': len(down),
                     'n_tiles': int(r.mgrs_tile_id.nunique()),
@@ -359,7 +372,8 @@ def _summary(granules: pd.DataFrame, roots: pd.DataFrame) -> pd.DataFrame:
             {
                 'tier': tier,
                 'root_class': 'TOTAL (unique granules)',
-                'n_root_granules': int((g.role == ROOT).sum()),
+                'n_failing': int(tier_roots[tier_roots.opera_id != ''].opera_id.nunique()),
+                'n_root_granules': len(listed_roots),
                 'n_root_passes': int((tier_roots.opera_id == '').sum()),
                 'n_downstream_caused': int((g.role == DOWNSTREAM).sum()),
                 'n_tiles': int(g.mgrs_tile_id.nunique()),

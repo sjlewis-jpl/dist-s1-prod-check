@@ -42,13 +42,13 @@ either way. A coverage gap is a root without a granule: its `cause_id` is a pass
 
 | tier | what it holds | downstream? |
 |---|---|---|
-| `candidate` | validated failure classes (all classes below except `inputs_pre` and UNKNOWN) | yes |
-| `under_review` | `inputs_pre` roots, and the downstream they would add on top of the candidates | yes, but kept apart |
+| `candidate` | validated failure classes (all classes below except `inputs_pre_*` and UNKNOWN) | yes |
+| `under_review` | `inputs_pre_missing` / `inputs_pre_extra` roots, and the downstream they would add on top of the candidates | yes, but kept apart |
 | `unverified` | UNKNOWN results: the check could not be done | no (unless `--unknown-as-failure`) |
 
 A granule is listed once, in the highest tier that reaches it (candidate > under_review > unverified). A granule
-that is an `inputs_pre` root but already downstream of a candidate root is listed as candidate downstream, with
-`inputs_pre` in `own_failures`.
+that is an `inputs_pre_*` root but already downstream of a candidate root is listed as candidate downstream, with
+the class in `own_failures`.
 
 ## Classes
 
@@ -138,18 +138,30 @@ listed in `generate.csv` to be produced. But every later product of the tile cha
 
 A product with no RTC-S1 pass behind it. None in the reference run.
 
-### `inputs_pre` (under_review)
+### `inputs_pre_missing`, `inputs_pre_extra` (under_review)
 
-The pre-image (baseline) RTC-S1 granules recorded in the product differ from a re-enumeration: "expected but not
-found" or "found but not expected". This class is held apart because it is large:
-- 6,580 products in 1,874 of the 14,930 tiles;
-- with its downstream, 25,716 granules.
+The pre-image (baseline) RTC-S1 granules recorded in the product differ from a re-enumeration:
 
-In the reference run every one of them has pre granules "expected but not found"; 15 also have some "found but not
-expected". That pattern may reflect a difference between this tool and the pipeline rather than bad products: for
-example, a baseline RTC granule published only after the product was made, or a different enumerator version.
-Triage it before acting on it. This class is also the most sensitive to an incomplete RTC-S1 table. The earlier run
-with four missing baseline days reported 39,155 products, nearly all of them artifacts.
+- `inputs_pre_missing`: the re-enumeration expects baseline granules the product did not use ("Pre RTC IDs
+  expected but not found");
+- `inputs_pre_extra`: the product used baseline granules the re-enumeration does not select ("Pre RTC IDs found
+  but not expected").
+
+A product can be in both. These classes are held apart because they are large and not yet understood:
+- `inputs_pre_missing`: 6,580 products in 1,874 of the 14,930 tiles; with its downstream, 25,716 granules;
+- `inputs_pre_extra`: 15 products, each of which is also `inputs_pre_missing`.
+
+What is known so far (reference run):
+- Availability does not explain it. All 43,522 expected-but-unused baseline granules were first processed before
+  the DIST-S1 product that should have used them.
+- They fall evenly across the three lookback years: 13,650 in year 1, 14,154 in year 2, 15,700 in year 3; median 4
+  per product. So it is not one lookback window, but a systematic difference in how baselines are chosen.
+- The expected list comes from `dist-s1-enumerator` (`enumerate_dist_s1_products`, multi-window lookback of 365,
+  730 and 1095 days, 60-day windows, at most 4/3/3 pre images per burst). It is applied to the RTC-S1 table this
+  tool downloads. The pipeline's own selection is in opera-sds-pcm `data_subscriber/rtc_for_dist/`
+  (`baseline_granule_retriever.py`, `rtc_for_dist_query.py`).
+- This class is the most sensitive to an incomplete RTC-S1 table. The earlier run with four missing baseline days
+  reported 39,155 `inputs_pre` products, nearly all of them artifacts.
 
 *Example.* `T01KAA_20260104T063221Z_20260509T070939Z_S1A`: the re-enumeration expects baseline granules the product
 did not use. 3 later products are downstream.
@@ -194,13 +206,18 @@ Workflow:
 | `roots.csv` | one row per root and class, coverage passes included, with the check's reason in `detail` |
 | `tiles.csv` | one row per tile and tier: products in the tile, roots, downstream, and the earliest root |
 | `generate.csv` | coverage gaps: passes with no product, to be produced |
-| `summary.csv` | per tier and class: root granules, root passes, downstream caused, tiles; plus a per-tier unique total |
-| `ids/*.txt` | one granule id per line: `<tier>.txt` (all), `<tier>_downstream.txt`, `<tier>_root_<class>.txt` |
+| `summary.csv` | per tier and class: granules failing, root granules listed, root passes, downstream caused, tiles; plus a per-tier unique total |
+| `ids/*.txt` | one granule id per line: `<tier>.txt` (everything listed in the tier), `<tier>_downstream.txt`, `<tier>_root_<class>.txt` (every granule failing the class) |
 | `deletion_lists_manifest.json` | source run, tool versions, options, counts, and the line count of every id file |
 
-In `summary.csv` the class rows overlap: one granule can fail several classes. The `TOTAL (unique granules)` rows
-count each granule once. `n_downstream_caused` credits each downstream granule to the class of the earliest root of
-its tile.
+Reading `summary.csv`:
+- `n_failing`: granules that failed the class, wherever they are listed.
+- `n_root_granules`: those listed as roots in this tier. A granule already listed in a higher tier (for example an
+  `inputs_pre_missing` product that is also candidate downstream) is failing but not a root here: 6,580 failing
+  against 6,221 roots in the reference run.
+- `n_downstream_caused`: downstream granules of this tier credited to the class of their tile's earliest root.
+- Granules to delete in a tier = `n_root_granules` + `n_downstream_caused` of its `TOTAL (unique granules)` row.
+  Class rows overlap, because a granule can fail several classes, so do not add them up.
 
 Counts for the reference run:
 
@@ -229,5 +246,5 @@ before it (same code, enumerator and parameters) showed both:
   The second run has one more `superseded_duplicate`, and its successor is a new `stale_chain`;
 - the first run's RTC-S1 table was missing every granule acquired 2024-01-28, 01-29, 02-13 and 02-14. During a CMR
   outage, CMR under-reported the hits for two 2-day chunks and the chunks were accepted (fixed by F39). This alone
-  produced 32,575 extra `inputs_pre` roots, 19 extra input roots in the candidate tier, and 64,231 extra listed
+  produced 32,575 extra `inputs_pre` products, 19 extra input roots in the candidate tier, and 64,231 extra listed
   granules.

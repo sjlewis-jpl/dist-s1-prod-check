@@ -221,7 +221,7 @@ def test_under_review_root_downstream_of_a_candidate_keeps_its_own_failure() -> 
     conf = _confirmation({_id(1): ('FAIL', 'no prior')})
     g = build_deletion_lists(_tables(inputs=inp, confirmation=conf)).granules.set_index('opera_id')
     assert (g.loc[_id(3), 'tier'], g.loc[_id(3), 'role']) == (CANDIDATE, DOWNSTREAM)
-    assert g.loc[_id(3), 'own_failures'] == 'inputs_pre'
+    assert g.loc[_id(3), 'own_failures'] == 'inputs_pre_extra'
 
 
 @pytest.mark.parametrize(
@@ -347,13 +347,43 @@ def test_summary_and_tiles_count_what_is_listed() -> None:
     inp = _inputs({_id(0): [('FAIL', 'Pre RTC IDs found but not expected')]})
     lists = build_deletion_lists(_tables(confirmation=conf, inputs=inp))
     s = lists.summary.set_index(['tier', 'root_class'])
-    assert s.loc[(CANDIDATE, 'confirmation_failure')].tolist() == [2, 0, 5, 2]
-    assert s.loc[(CANDIDATE, 'TOTAL (unique granules)')].tolist() == [2, 0, 5, 2]
-    assert s.loc[(UNDER_REVIEW, 'TOTAL (unique granules)')].tolist() == [1, 0, 1, 1]
+    # n_failing, n_root_granules, n_root_passes, n_downstream_caused, n_tiles
+    assert s.loc[(CANDIDATE, 'confirmation_failure')].tolist() == [2, 2, 0, 5, 2]
+    assert s.loc[(CANDIDATE, 'TOTAL (unique granules)')].tolist() == [2, 2, 0, 5, 2]
+    assert s.loc[(UNDER_REVIEW, 'TOTAL (unique granules)')].tolist() == [1, 1, 0, 1, 1]
     tiles = lists.tiles.set_index(['mgrs_tile_id', 'tier'])
     assert tiles.loc[(TILE, CANDIDATE), ['n_products_in_tile', 'n_roots', 'n_downstream']].tolist() == [5, 1, 2]
     assert tiles.loc[(TILE, CANDIDATE), 'cause_id'] == _id(2)
     assert tiles.loc[(TILE, UNDER_REVIEW), 'cause_id'] == _id(0)
+
+
+def test_summary_separates_failing_from_listed_roots() -> None:
+    """A pre-input failure already downstream of a candidate root fails its class but adds no under-review root."""
+    inp = _inputs({_id(3): [('FAIL', 'Pre RTC IDs expected but not found')]})
+    conf = _confirmation({_id(1): ('FAIL', 'no prior')})
+    s = build_deletion_lists(_tables(inputs=inp, confirmation=conf)).summary.set_index(['tier', 'root_class'])
+    assert s.loc[(UNDER_REVIEW, 'inputs_pre_missing')].tolist() == [1, 0, 0, 0, 1]
+    assert s.loc[(UNDER_REVIEW, 'TOTAL (unique granules)')].tolist() == [1, 0, 0, 0, 0]
+    assert s.loc[(CANDIDATE, 'TOTAL (unique granules)')].tolist() == [1, 1, 0, 3, 1]
+
+
+@pytest.mark.parametrize(
+    ('issues', 'classes'),
+    [
+        (['Pre RTC IDs expected but not found'], ['inputs_pre_missing']),
+        (['Pre RTC IDs found but not expected'], ['inputs_pre_extra']),
+        (
+            ['Pre RTC IDs expected but not found', 'Pre RTC IDs found but not expected'],
+            ['inputs_pre_missing', 'inputs_pre_extra'],
+        ),
+    ],
+)
+def test_pre_input_failures_split_by_direction(issues: list[str], classes: list[str]) -> None:
+    lists = build_deletion_lists(_tables(inputs=_inputs({_id(2): [('FAIL', i) for i in issues]})))
+    assert list(lists.roots.root_class) == classes
+    assert set(lists.roots.level) == {UNDER_REVIEW}
+    assert _listed(lists, UNDER_REVIEW) == [_id(2), _id(3), _id(4)]
+    assert lists.granules.set_index('opera_id').loc[_id(2), 'own_failures'] == ';'.join(classes)
 
 
 def test_all_pass_lists_nothing() -> None:
@@ -485,7 +515,7 @@ def test_written_files_and_id_lists(tmp_path: Path) -> None:
     assert ids['candidate.txt'] == [_id(2), _id(3), _id(4)]
     assert ids['candidate_downstream.txt'] == [_id(3), _id(4)]
     assert ids['candidate_root_confirmation_failure.txt'] == [_id(2)]
-    assert ids['under_review_root_inputs_pre.txt'] == [_id(0, OTHER)]
+    assert ids['under_review_root_inputs_pre_extra.txt'] == [_id(0, OTHER)]
     meta = json.loads((target / deletion.DELETION_MANIFEST_FILE).read_text())
     assert meta['counts'][CANDIDATE] == {'granules': 3, 'roots': 1, 'downstream': 2}
     assert meta['id_files'] == {k: len(v) for k, v in ids.items()}
